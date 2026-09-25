@@ -14,14 +14,21 @@ joints_name = [
 contact_frame = ['left_leg_4_collision', 'right_leg_4_collision']
 body_name = ['left_leg_4', 'right_leg_4']
 
-simulation_frequency = 500 
+simulation_frequency = 500
 whole_body_frequency = 100
 mpc_frequency = 100
 dt_mpc = 0.01
 N = 50
-mpc_horizon_s = 0.5
+mpc_horizon_s = N * dt_mpc
 mpc_iterations = 1
 wbc_lookahead_dt = 0.0
+
+dt_sim = 1.0 / simulation_frequency
+dt_wbc = 1.0 / whole_body_frequency
+mpc_period_steps = round(simulation_frequency / mpc_frequency)
+wbc_period_steps = round(simulation_frequency / whole_body_frequency)
+mpc_shift_nodes = round(1.0 / (mpc_frequency * dt_mpc))
+
 T_TRAJECTORY = 60
 grav = 9.81
 

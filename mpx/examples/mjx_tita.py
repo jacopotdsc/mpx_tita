@@ -14,7 +14,7 @@ import mujoco
 import mujoco.viewer
 import numpy as np
 
-import mpx.config.config_dfcip as config
+import mpx.config.config_tita as config
 import mpx.utils.mpc_wrapper_dfcip as mpc_wrapper_dfcip
 import mpx.utils.sim as sim_utils
 
@@ -51,8 +51,8 @@ def _gather_raw_state(model, data, base_body_id, contact_ids):
 def main(headless=False, steps=500, scene="flat"):
     model = mujoco.MjModel.from_xml_path(dir_path + f"/../data/tita/scene_{scene}.xml")
     data = mujoco.MjData(model)
-    sim_frequency = float(config.whole_body_frequency)
-    model.opt.timestep = 1.0 / sim_frequency
+    sim_frequency = float(config.simulation_frequency)
+    model.opt.timestep = config.dt_sim
 
     base_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, config.base_body_name)
     contact_ids = sim_utils.geom_ids(model, config.contact_frame)
@@ -90,37 +90,39 @@ def main(headless=False, steps=500, scene="flat"):
         tita_state[15:18][None, :],
     )
     tau.block_until_ready()
-    mpc.reset()
+    mpc_state = mpc.reset()
 
-    period = int(sim_frequency / config.mpc_frequency)
-    print(f"sim_frequency: {sim_frequency} Hz, mpc_frequency: {config.mpc_frequency} Hz")
+    period = config.mpc_period_steps
+    wbc_period = config.wbc_period_steps
+    print(f"sim_frequency: {sim_frequency} Hz, "
+          f"whole_body_frequency: {config.whole_body_frequency} Hz, "
+          f"mpc_frequency: {config.mpc_frequency} Hz")
     counter = 0
 
     def step_controller(mpc_state, tau, qddot, theta_prev):
         nonlocal counter
 
-        qpos = data.qpos.copy()
-        qvel = data.qvel.copy()
-
-        raw = _gather_raw_state(model, data, base_body_id, contact_ids)
-        tita_state, x0, theta_prev = mpc.process_state(*raw, theta_prev)
+        if counter % period == 0 or counter % wbc_period == 0:
+            raw = _gather_raw_state(model, data, base_body_id, contact_ids)
+            tita_state, x0, theta_prev = mpc.process_state(*raw, theta_prev)
 
         if counter % period == 0:
             command = jnp.asarray(command_handle.mpc_wheeled_input())
             mpc_state, _ = mpc.run(mpc_state, x0[None, :], command[None, :])
 
-        mpc_state, tau, qddot, _, _, _ = mpc.whole_body_run(
-            mpc_state,
-            x0,
-            jnp.asarray(qpos)[None, :],
-            jnp.asarray(qvel)[None, :],
-            tita_state[6:9][None, :],
-            tita_state[9:12][None, :],
-            tita_state[12:15][None, :],
-            tita_state[15:18][None, :],
-        )
+        if counter % wbc_period == 0:
+            mpc_state, tau, qddot, _, _, _ = mpc.whole_body_run(
+                mpc_state,
+                x0,
+                jnp.asarray(data.qpos.copy())[None, :],
+                jnp.asarray(data.qvel.copy())[None, :],
+                tita_state[6:9][None, :],
+                tita_state[9:12][None, :],
+                tita_state[12:15][None, :],
+                tita_state[15:18][None, :],
+            )
+            data.ctrl = np.asarray(tau[0])
 
-        data.ctrl = np.asarray(tau[0])
         mujoco.mj_step(model, data)
         counter += 1
 
@@ -147,10 +149,10 @@ def main(headless=False, steps=500, scene="flat"):
             if overlay_text is not None:
                 viewer.set_texts((None, None, *overlay_text))
             mpc_state, tau, qddot, theta_prev = step_controller(mpc_state, tau, qddot, theta_prev)
+            viewer.sync()
             toc = timer()
             if toc - tic < model.opt.timestep:
                 time.sleep(model.opt.timestep - (toc - tic))
-            viewer.sync()
 
 
 if __name__ == "__main__":

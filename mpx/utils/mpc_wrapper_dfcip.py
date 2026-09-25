@@ -8,7 +8,6 @@ import mpx.utils.objectives as mpc_objectives
 import mujoco
 from mujoco import mjx
 import mpx.jax_ocp_solvers.optimizers as optimizers
-from mpx.utils.timing import derive_timing
 
 
 @struct.dataclass
@@ -37,9 +36,8 @@ class BatchedMPCControllerWrapper:
         self.n_env = n_env
         self.config = config
 
-        self.timing = derive_timing(config)
         self.mpc_frequency = config.mpc_frequency
-        self.shift = self.timing["mpc_shift_nodes"]
+        self.shift = config.mpc_shift_nodes
         self.mpc_iterations = int(getattr(config, "mpc_iterations", 1))
         self.wbc_lookahead_dt = float(getattr(config, "wbc_lookahead_dt", 0.0))
 
@@ -89,7 +87,7 @@ class BatchedMPCControllerWrapper:
                 X_it, U_it, D_it = fddp(reference, parameter, W, x0, X_it, U_it)
             return X_it, U_it, D_it
 
-        dt_wbc = self.timing["dt_wbc"]
+        dt_wbc = config.dt_wbc
         n_contacts = 1
 
         def whole_body_control(qpos, qvel, desired):

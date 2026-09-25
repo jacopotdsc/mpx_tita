@@ -1,4 +1,5 @@
 import jax
+import qpax
 from jax import numpy as jnp
 from functools import partial
 from mujoco.mjx._src import math
