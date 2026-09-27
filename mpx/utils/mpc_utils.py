@@ -281,6 +281,8 @@ def reference_generator_dfcip_online(
     dt: float,
     m: float,
     grav: float,
+    h_min: float,
+    h_max: float,
     x0: jax.Array,
     cmd: jax.Array,
 ):
@@ -300,7 +302,7 @@ def reference_generator_dfcip_online(
 
     v_des = cmd[0]
     omega_des = cmd[2]
-    z_com_ref = cmd[3]
+    z_com_ref = jnp.clip(cmd[3], h_min, h_max)
 
     def move_towards(current, target, max_delta):
         delta = target - current

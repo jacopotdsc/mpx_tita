@@ -48,8 +48,12 @@ def _gather_raw_state(model, data, base_body_id, contact_ids):
     return pcom, vcom, centers, Rs, radii, feet_vel
 
 
-def main(headless=False, steps=500, scene="flat"):
-    model = mujoco.MjModel.from_xml_path(dir_path + f"/../data/tita/scene_{scene}.xml")
+def main(headless=False, steps=500, scene="flat", *, model=None,
+         controller_model=None, on_step=None):
+    # Optional model/observer injection supports controlled XML-versus-URDF
+    # experiments without duplicating or changing step_controller.
+    if model is None:
+        model = mujoco.MjModel.from_xml_path(dir_path + f"/../data/tita/scene_{scene}.xml")
     data = mujoco.MjData(model)
     sim_frequency = float(config.simulation_frequency)
     model.opt.timestep = config.dt_sim
@@ -69,7 +73,7 @@ def main(headless=False, steps=500, scene="flat"):
         height_limits=(config.h_min, config.h_max),
     )
 
-    mpc = mpc_wrapper_dfcip.BatchedMPCControllerWrapper(config, n_env=1)
+    mpc = mpc_wrapper_dfcip.BatchedMPCControllerWrapper(config, n_env=1, model=controller_model)
 
     _reset_to_initial_state(model, data)
 
@@ -124,6 +128,8 @@ def main(headless=False, steps=500, scene="flat"):
             data.ctrl = np.asarray(tau[0])
 
         mujoco.mj_step(model, data)
+        if on_step is not None:
+            on_step(model, data, tau)
         counter += 1
 
         return mpc_state, tau, qddot, theta_prev

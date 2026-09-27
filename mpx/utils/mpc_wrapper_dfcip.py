@@ -28,7 +28,7 @@ class MPCState:
 
 
 class BatchedMPCControllerWrapper:
-    def __init__(self, config, n_env):
+    def __init__(self, config, n_env, model=None):
         jax.config.update("jax_compilation_cache_dir", "./jax_cache")
         jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
         jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
@@ -41,7 +41,9 @@ class BatchedMPCControllerWrapper:
         self.mpc_iterations = int(getattr(config, "mpc_iterations", 1))
         self.wbc_lookahead_dt = float(getattr(config, "wbc_lookahead_dt", 0.0))
 
-        model = mujoco.MjModel.from_xml_path(config.model_path)
+        if model is None:
+            print("[Warning] Model not provided. Loading model from XML path:", config.model_path)
+            model = mujoco.MjModel.from_xml_path(config.model_path)
         mjx_model = mjx.put_model(model)
         self._mjx_model = mjx_model
 
@@ -79,7 +81,7 @@ class BatchedMPCControllerWrapper:
         hess     = partial(mpc_objectives.wheeled_dfcip_hessian_gn, config.d, config.N)
         dynamics = partial(mpc_dyn_model.wheeled_dfcip_dynamics, mjx_model, config.mass, config.grav, config.dt_mpc)
         fddp     = partial(optimizers.fddp_mpc, cost, dynamics, hess, False)
-        ref_gen  = partial(mpc_utils.reference_generator_dfcip_online, config.N, config.dt_mpc, config.mass, config.grav)
+        ref_gen  = partial(mpc_utils.reference_generator_dfcip_online, config.N, config.dt_mpc, config.mass, config.grav, config.h_min, config.h_max)
 
         def work(reference, parameter, W, x0, X_init, U_init):
             X_it, U_it, D_it = X_init, U_init, None
@@ -172,8 +174,16 @@ class BatchedMPCControllerWrapper:
         )
         return new_state, reference
 
-    def whole_body_run(self, state: MPCState, x0, qpos, qvel, pl_world, pr_world, dpl_world, dpr_world):
+    def whole_body_run(self, state: MPCState, x0, qpos, qvel, pl_world, pr_world, dpl_world, dpr_world, com_height_target=None):
         desired = self._build_desired_jit(x0, qpos, state, pl_world, pr_world, dpl_world, dpr_world)
+        if com_height_target is not None:
+            # ROS/Gazebo runs asynchronously and has different contact dynamics.
+            # Keep actual vertical task feedback instead of cancelling its PD
+            # error by setting the desired position/velocity to the measurement.
+            # MPC still supplies feedforward acceleration. Standalone callers
+            # retain their original behavior when no height target is supplied.
+            desired = desired.at[:, self._index_variables_qp['com_pos'] + 2].set(com_height_target)
+            desired = desired.at[:, self._index_variables_qp['com_vel'] + 2].set(0.0)
         tau_cmd, qddot, fl, fr = self._whole_body_interface(qpos, qvel, desired)
         return state, tau_cmd, qddot, fl, fr, desired
 
@@ -182,7 +192,6 @@ class BatchedMPCControllerWrapper:
         return self.init_state()
 
     def _process_state_impl(self, pcom, vcom, centers, Rs, radii, feet_vel, theta_prev):
-        cfg = self.config
 
         l_rcp = mpc_utils.get_rCP(Rs[0], radii[0])
         r_rcp = mpc_utils.get_rCP(Rs[1], radii[1])
@@ -196,7 +205,10 @@ class BatchedMPCControllerWrapper:
         c_world = (pl_world + pr_world) / 2.0
         vc_world = (dpl_world + dpr_world) / 2.0
 
-        diff = pl_world - pr_world
+        # Heading and its rate must use the same wheel-center baseline as
+        # feet_vel. The actual spacing changes with leg posture; config.d is
+        # a nominal prediction-model parameter, not a measured track width.
+        diff = centers[0] - centers[1]
         theta_wrapped = jnp.arctan2(-diff[0], diff[1])
         a = (theta_wrapped - theta_prev + jnp.pi) % (2 * jnp.pi)
         a = jnp.where(a < 0, a + 2 * jnp.pi, a) - jnp.pi
@@ -206,7 +218,8 @@ class BatchedMPCControllerWrapper:
         R = jnp.array([[ct, -st, 0.0], [st, ct, 0.0], [0.0, 0.0, 1.0]])
         dpl_b = R.T @ dpl_world
         dpr_b = R.T @ dpr_world
-        w = (dpr_b[0] - dpl_b[0]) / cfg.d
+        track_width = jnp.maximum(jnp.linalg.norm(diff[:2]), 1e-6)
+        w = (dpr_b[0] - dpl_b[0]) / track_width
         v = (dpr_b[0] + dpl_b[0]) / 2.0
 
         x0 = jnp.concatenate([
@@ -302,7 +315,7 @@ class BatchedMPCControllerWrapper:
         lwheel_pos_ref = pos_pl_.at[:, 2].set(pos_pl_[:, 2] + cfg.wheel_radius)
         lwheel_vel_ref = vel_pl_
         lwheel_acc_ref = acc_pl_
-        rwheel_pos_ref = pos_pr_.at[:, 2].set(pos_pl_[:, 2] + cfg.wheel_radius)
+        rwheel_pos_ref = pos_pr_.at[:, 2].set(pos_pr_[:, 2] + cfg.wheel_radius)
         rwheel_vel_ref = vel_pr_
         rwheel_acc_ref = acc_pr_
 
