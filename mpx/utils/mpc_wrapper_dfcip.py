@@ -26,6 +26,7 @@ class MPCState:
     X0_shifted : jax.Array
     U0_shifted : jax.Array
     D0_shifted : jax.Array
+    ref_rate   : jax.Array   # [v, acc_v, omega, acc_omega] the next reference starts from
 
 
 class BatchedMPCControllerWrapper:
@@ -85,7 +86,9 @@ class BatchedMPCControllerWrapper:
         hess     = partial(mpc_objectives.wheeled_dfcip_hessian_gn, config.d, config.N)
         dynamics = partial(mpc_dyn_model.wheeled_dfcip_dynamics, mjx_model, config.mass, config.grav, config.dt_mpc)
         fddp     = partial(optimizers.fddp_mpc, cost, dynamics, hess, False)
-        ref_gen  = partial(mpc_utils.reference_generator_dfcip_online, config.N, config.dt_mpc, config.mass, config.grav, config.h_min, config.h_max)
+        ref_gen  = partial(mpc_utils.reference_generator_dfcip_online, config.N, config.dt_mpc, config.mass, config.grav, config.h_min, config.h_max,
+                           config.a_default, config.tau_v,
+                           config.alpha_default, config.tau_omega, config.az_default)
 
         def work(reference, parameter, W, x0, X_init, U_init):
             X_it, U_it, D_it = X_init, U_init, None
@@ -132,17 +135,22 @@ class BatchedMPCControllerWrapper:
 
         if x0 is None:
             X_init = self._X0_init
+            ref_rate = jnp.zeros((n, 4))
         else:
             x0 = jnp.asarray(x0)
             if x0.ndim == 1:
                 x0 = x0[None, :]
             X_init = jnp.broadcast_to(x0[:, None, :], (self.n_env, cfg.N + 1, cfg.nx))
+            # The reference starts at the measured velocities, with zero acceleration.
+            zero = jnp.zeros_like(x0[:, 11])
+            ref_rate = jnp.stack([x0[:, 11], zero, x0[:, 12], zero], axis=1)
 
         return MPCState(
             sol=ControlSol(a=a, ac_z=ac_z, alpha=alpha, grf=grf),
             X0_shifted=X_init,
             U0_shifted=self._U0_init,
             D0_shifted=self._D0_init,
+            ref_rate=ref_rate,
         )
 
     def process_state(self, pcom, vcom, centers, Rs, radii, feet_vel, theta_prev):
@@ -158,7 +166,7 @@ class BatchedMPCControllerWrapper:
     def run(self, state: MPCState, x0, cmd) -> MPCState:
         cfg = self.config
 
-        x_ref, u_ref = self._ref_gen(x0, cmd)
+        x_ref, u_ref, rates = self._ref_gen(x0, cmd, state.ref_rate)
         reference = jnp.concatenate([x_ref, u_ref], axis=-1)
         parameter = None
 
@@ -181,6 +189,7 @@ class BatchedMPCControllerWrapper:
             X0_shifted=new_X0,
             U0_shifted=new_U0,
             D0_shifted=new_D0,
+            ref_rate=rates[:, self.shift],  # one MPC period ahead
         )
         return new_state, reference
 

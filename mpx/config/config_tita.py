@@ -35,6 +35,12 @@ grav = 9.81
 robot_height = 0.44  # Robot base height in meters
 h_min = 0.28
 h_max = 0.4
+
+a_default = 1.0       # m/s^2
+tau_v = 0.5           # s; a 1 m/s step peaks at 1/(e*tau) = 0.74 m/s^2
+alpha_default = 1.0   # rad/s^2
+tau_omega = 0.5       # s
+az_default = 1.0      # m/s^2, ramp of the vertical velocity reference
 com_z_to_track = 0.4
 clearence_speed = 0.4
 
@@ -52,7 +58,7 @@ n_contact = len(contact_frame)
 nx = 13
 nu = 9
 mass = 27.68978  # Sum of inertial masses in the canonical tita_running.urdf
-d = 0.567  # leg distance (m)
+d = 0.6  # wheel track of the MPC model (m); 0.567 from q0, 0.6 better on the real robot
 # Centroidal inertia at q0 from the aligned model, expressed in the base frame.
 inertia = jnp.array([
     [1.090008860808705, -2.6318929583168255e-05, -0.029887671948266012],
@@ -117,9 +123,9 @@ w_eq = 1e6       # Equality-constraint penalty
 w_stab = w_eq    # Terminal constraint: CoM over the wheel-contact midpoint
 
 # Bounds on the wheel-related MPC inputs, |u| <= bound: an inequality constraint in the
-# MPC, penalised with w_eq like the other constraints. 100 = inactive: in W they break
-# braking (a <= 3 m/s^2 from 1 m/s: the robot sits down, Gazebo 2026-10-21), so only
-# W_takeover sets them.
+# MPC, penalised with w_eq like the other constraints. Defaults 100 (inactive); W and
+# W_takeover set their own. W: 2 with the reference ramps at 0.5 (mpc_utils a_default...):
+# smooth starts and stops; 1 falls braking from -0.6 m/s (Gazebo 2026-10-21).
 a_max = 100.0      # m/s^2, linear acceleration
 ac_z_max = 100.0   # m/s^2, vertical acceleration
 alpha_max = 100.0  # rad/s^2, angular acceleration
@@ -134,7 +140,7 @@ def _weights(**override):
     return jnp.diag(jnp.array(list(v.values())))
 
 
-W = _weights()
+W = _weights(a_max=2.0, ac_z_max=2.0, alpha_max=2.0)
 
 # MPC weights while standing up from transform_up (C++ node: from the takeover until the
 # COM holds at h_mpc), then W. At the end of transform_up the shins rest on the ground and

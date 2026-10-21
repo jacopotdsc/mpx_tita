@@ -283,15 +283,23 @@ def reference_generator_dfcip_online(
     grav: float,
     h_min: float,
     h_max: float,
+    a_default: float,
+    tau_v: float,
+    alpha_default: float,
+    tau_omega: float,
+    az_default: float,
     x0: jax.Array,
     cmd: jax.Array,
+    rate0: jax.Array,
 ):
     z_contact_ref = 0.0
     vcz_ref = 0.0
 
-    a_default = 5.0
-    alpha_default = 5.0
-    az_default = 2.0
+    # Velocity / yaw-rate profile: critically damped second order towards the command (time
+    # constant tau_v / tau_omega), so its acceleration rises from and returns to zero without
+    # overshoot. rate0 = [v, acc_v, omega, acc_omega] continues the previous solve's profile
+    # (MPCState.ref_rate). The references start from the measured velocities and follow the
+    # profile with slope <= a_default / alpha_default.
     z_position_gain = 2.0
 
     pcom0 = x0[0:3]
@@ -340,14 +348,15 @@ def reference_generator_dfcip_online(
             m * grav / 2.0,
         ])
 
-    def scan_step(carry, _):
-        p_xy, z, theta, v, vz, omega = carry
+    def second_order(rate, acc, target, tau):
+        acc_next = acc + dt * ((target - rate) / tau**2 - 2.0 * acc / tau)
+        return rate + acc_next * dt, acc_next
 
-        v_next = move_towards(
-            v,
-            v_des,
-            a_default * dt,
-        )
+    def scan_step(carry, _):
+        p_xy, z, theta, v, vz, omega, v_prof, acc_v, omega_prof, acc_omega = carry
+
+        v_prof_next, acc_v_next = second_order(v_prof, acc_v, v_des, tau_v)
+        v_next = move_towards(v, v_prof_next, a_default * dt)
 
         vz_target = z_position_gain * (z_com_ref - z)
         vz_next = move_towards(
@@ -356,11 +365,8 @@ def reference_generator_dfcip_online(
             az_default * dt,
         )
 
-        omega_next = move_towards(
-            omega,
-            omega_des,
-            alpha_default * dt,
-        )
+        omega_prof_next, acc_omega_next = second_order(omega_prof, acc_omega, omega_des, tau_omega)
+        omega_next = move_towards(omega, omega_prof_next, alpha_default * dt)
 
         vx_next = v_next * jnp.cos(theta)
         vy_next = v_next * jnp.sin(theta)
@@ -393,9 +399,14 @@ def reference_generator_dfcip_online(
             v_next,
             vz_next,
             omega_next,
+            v_prof_next,
+            acc_v_next,
+            omega_prof_next,
+            acc_omega_next,
         )
 
-        return carry_next, (x_ref_t, u_ref_t)
+        rate_t = jnp.stack([v_prof_next, acc_v_next, omega_prof_next, acc_omega_next])
+        return carry_next, (x_ref_t, u_ref_t, rate_t)
 
     x_init = build_state(
         p_xy=pcom0[0:2],
@@ -418,9 +429,13 @@ def reference_generator_dfcip_online(
         v0,
         vcom_z0,
         omega0,
+        rate0[0],
+        rate0[1],
+        rate0[2],
+        rate0[3],
     )
 
-    _, (x_scan, u_scan) = jax.lax.scan(
+    _, (x_scan, u_scan, rate_scan) = jax.lax.scan(
         scan_step,
         carry0,
         xs=None,
@@ -436,7 +451,9 @@ def reference_generator_dfcip_online(
         u_scan,
     ], axis=0)
 
-    return x_ref, u_ref
+    # Reference rates per node: index k continues the profile k nodes ahead.
+    rates = jnp.concatenate([rate0[None, :], rate_scan], axis=0)
+    return x_ref, u_ref, rates
 
 
 import mujoco
