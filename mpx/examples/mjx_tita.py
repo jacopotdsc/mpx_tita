@@ -48,6 +48,14 @@ def _gather_raw_state(model, data, base_body_id, contact_ids):
     return pcom, vcom, centers, Rs, radii, feet_vel
 
 
+def _mpc_due(counter, simulation_frequency, mpc_frequency):
+    # At 500 Hz, 40 Hz uses alternating 13/12 physics steps (26/24 ms).
+    # Keep the requested average rate instead of rounding 12.5 steps to 12.
+    tick_ns = round(1e9 / simulation_frequency)
+    period_ns = round(1e9 / mpc_frequency)
+    return counter == 0 or counter * tick_ns // period_ns > (counter - 1) * tick_ns // period_ns
+
+
 def main(headless=False, steps=500, scene="flat", *, model=None,
          controller_model=None, on_step=None):
     # Optional model/observer injection supports controlled XML-versus-URDF
@@ -96,7 +104,6 @@ def main(headless=False, steps=500, scene="flat", *, model=None,
     tau.block_until_ready()
     mpc_state = mpc.reset()
 
-    period = config.mpc_period_steps
     wbc_period = config.wbc_period_steps
     print(f"sim_frequency: {sim_frequency} Hz, "
           f"whole_body_frequency: {config.whole_body_frequency} Hz, "
@@ -106,11 +113,12 @@ def main(headless=False, steps=500, scene="flat", *, model=None,
     def step_controller(mpc_state, tau, qddot, theta_prev):
         nonlocal counter
 
-        if counter % period == 0 or counter % wbc_period == 0:
+        mpc_due = _mpc_due(counter, sim_frequency, config.mpc_frequency)
+        if mpc_due or counter % wbc_period == 0:
             raw = _gather_raw_state(model, data, base_body_id, contact_ids)
             tita_state, x0, theta_prev = mpc.process_state(*raw, theta_prev)
 
-        if counter % period == 0:
+        if mpc_due:
             command = jnp.asarray(command_handle.mpc_wheeled_input())
             mpc_state, _ = mpc.run(mpc_state, x0[None, :], command[None, :])
 

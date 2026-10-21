@@ -1,4 +1,5 @@
 import jax
+import math
 import jax.numpy as jnp
 from functools import partial
 from flax import struct
@@ -37,7 +38,10 @@ class BatchedMPCControllerWrapper:
         self.config = config
 
         self.mpc_frequency = config.mpc_frequency
-        self.shift = config.mpc_shift_nodes
+        shift = 1.0 / (config.mpc_frequency * config.dt_mpc)
+        if not math.isfinite(shift) or abs(shift - round(shift)) > 1e-6 or not 1 <= round(shift) <= config.N:
+            raise ValueError('MPC period must span a whole number of prediction nodes within the horizon')
+        self.shift = int(round(shift))
         self.mpc_iterations = int(getattr(config, "mpc_iterations", 1))
         self.wbc_lookahead_dt = float(getattr(config, "wbc_lookahead_dt", 0.0))
 
@@ -99,7 +103,7 @@ class BatchedMPCControllerWrapper:
                 config.wheel_radius, dt_wbc, n_contacts,
                 config.Kp_motion, config.Kd_motion, config.Kp_wheel, config.Kd_wheel, config.Kp_reg, config.Kd_reg,
                 config.w_posture,
-                config.w_qddot, config.w_com, config.w_lwheel, config.w_rwheel, config.w_base,
+                config.w_qddot, config.w_force, config.w_com, config.w_lwheel, config.w_rwheel, config.w_base,
                 config.mu,
                 qpos, qvel, desired,
                 posture_mask=self._posture_mask,
@@ -144,6 +148,13 @@ class BatchedMPCControllerWrapper:
     def process_state(self, pcom, vcom, centers, Rs, radii, feet_vel, theta_prev):
         return self._process_state_jit(pcom, vcom, centers, Rs, radii, feet_vel, theta_prev)
 
+    @partial(jax.jit, static_argnums=(0,))
+    def shift_warm_start(self, trajectory):
+        """Advance the solver guess by whole nodes and hold the terminal value."""
+        s = self.shift
+        return jnp.concatenate([trajectory[:, s:, :],
+                                jnp.tile(trajectory[:, -1:, :], (1, s, 1))], axis=1)
+
     def run(self, state: MPCState, x0, cmd) -> MPCState:
         cfg = self.config
 
@@ -161,10 +172,9 @@ class BatchedMPCControllerWrapper:
 
         D = jnp.nan_to_num(D, nan=0.0, posinf=0.0, neginf=0.0)
 
-        s = self.shift
-        new_X0 = jnp.concatenate([X[:, s:, :], jnp.tile(X[:, -1:, :], (1, s, 1))], axis=1)
-        new_U0 = jnp.concatenate([U[:, s:, :], jnp.tile(U[:, -1:, :], (1, s, 1))], axis=1)
-        new_D0 = jnp.concatenate([D[:, s:, :], jnp.tile(D[:, -1:, :], (1, s, 1))], axis=1)
+        new_X0 = self.shift_warm_start(X)
+        new_U0 = self.shift_warm_start(U)
+        new_D0 = self.shift_warm_start(D)
 
         new_state = MPCState(
             sol=ControlSol(a=new_a, ac_z=new_ac_z, alpha=new_alpha, grf=new_grf),

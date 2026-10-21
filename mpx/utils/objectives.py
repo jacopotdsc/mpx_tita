@@ -36,6 +36,8 @@ def wheeled_dfcip_obj(wheel_offset, N, W, reference, x, u, t):
     h_moment    = jnp.cross(pl - pcom, fl) + jnp.cross(pr - pcom, fr) 
     h_fz        = jnp.minimum(fl[2], 0.0) ** 2 + jnp.minimum(fr[2], 0.0) ** 2  
     h_stability = pcom[:2] - c[:2]                                      #
+    u_bound     = jnp.array([W[16, 16], W[17, 17], W[18, 18]])           # |a|, |ac_z|, |alpha| bounds
+    h_bound     = jnp.maximum(jnp.abs(u[0:3]) - u_bound, 0.0)
  
     w_pcomxy, w_pcomz   = W[0, 0],  W[1, 1]
     w_vcomxy, w_vcomz   = W[2, 2],  W[3, 3]
@@ -44,6 +46,7 @@ def wheeled_dfcip_obj(wheel_offset, N, W, reference, x, u, t):
     w_a, w_ac_z, w_alpha = W[9, 9], W[10, 10], W[11, 11]
     w_fcxy, w_fcz       = W[12, 12], W[13, 13]
     w_eq                = W[14, 14]
+    w_stab              = W[15, 15]   # terminal COM-over-contact (h_stability)
  
     sc_pcomxy = 0.5 * w_pcomxy * jnp.sum((pcom[:2] - x_ref[0:2]) ** 2)
     sc_pcomz  = 0.5 * w_pcomz  *         (pcom[2]  - x_ref[2])   ** 2
@@ -71,6 +74,7 @@ def wheeled_dfcip_obj(wheel_offset, N, W, reference, x, u, t):
     sc_contact = 0.5 * w_eq * h_contact ** 2
     sc_moment  = 0.5 * w_eq * jnp.dot(h_moment, h_moment)
     sc_hfz     = 0.5 * w_eq * h_fz
+    sc_bound   = 0.5 * w_eq * jnp.dot(h_bound, h_bound)
 
     stage_cost = (
         sc_pcomxy
@@ -92,6 +96,7 @@ def wheeled_dfcip_obj(wheel_offset, N, W, reference, x, u, t):
         + sc_contact
         + sc_moment
         + sc_hfz
+        + sc_bound
     )
     
     tc_pcomxy = 0.5 * w_pcomxy * jnp.sum((pcom[:2] - x_ref[0:2]) ** 2)
@@ -108,7 +113,7 @@ def wheeled_dfcip_obj(wheel_offset, N, W, reference, x, u, t):
     tc_w      = 0.5 * w_w      *         (w        - x_ref[12])  ** 2
 
     tc_contact   = 0.5 * w_eq * h_contact ** 2
-    tc_stability = 0.5 * w_eq * jnp.dot(h_stability, h_stability)
+    tc_stability = 0.5 * w_stab * jnp.dot(h_stability, h_stability)
 
     term_cost = (
         tc_pcomxy
@@ -138,7 +143,8 @@ def wheeled_dfcip_hessian_gn(wheel_offset, N, W, reference, x, u, t):
         W[14, 14],                            
         W[14, 14], W[14, 14], W[14, 14],
         W[14, 14], W[14, 14],                 
-        W[14, 14], W[14, 14],
+        W[15, 15], W[15, 15],
+        W[14, 14], W[14, 14], W[14, 14],
     ])
     W_res = jnp.diag(w_diag)
  
@@ -160,6 +166,8 @@ def wheeled_dfcip_hessian_gn(wheel_offset, N, W, reference, x, u, t):
         h_moment    = jnp.cross(pl - pcom_, fl_) + jnp.cross(pr - pcom_, fr_)
         h_fz        = jnp.array([jnp.minimum(fl_[2], 0.0), jnp.minimum(fr_[2], 0.0)])
         h_stability = pcom_[:2] - c_[:2]
+        u_bound     = jnp.array([W[16, 16], W[17, 17], W[18, 18]])
+        h_bound     = jnp.maximum(jnp.abs(u[0:3]) - u_bound, 0.0)
  
         stage_res = jnp.concatenate([
             pcom_ - x_ref[0:3],
@@ -172,6 +180,7 @@ def wheeled_dfcip_hessian_gn(wheel_offset, N, W, reference, x, u, t):
             h_moment,
             h_fz,
             jnp.zeros_like(h_stability),
+            h_bound,
         ])
  
         term_res = jnp.concatenate([
@@ -185,6 +194,7 @@ def wheeled_dfcip_hessian_gn(wheel_offset, N, W, reference, x, u, t):
             jnp.zeros(3),
             jnp.zeros(2),
             h_stability,
+            jnp.zeros(3),
         ])
  
         return jnp.where(t == N, term_res, stage_res)
