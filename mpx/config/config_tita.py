@@ -36,8 +36,8 @@ robot_height = 0.44  # Robot base height in meters
 h_min = 0.28
 h_max = 0.4
 
-a_default = 1.0       # m/s^2
-tau_v = 0.5           # s; a 1 m/s step peaks at 1/(e*tau) = 0.74 m/s^2
+a_default = 4.0       # m/s^2
+tau_v = 0.25          # s; a 1 m/s step peaks at 1/(e*tau) = 1.47 m/s^2
 alpha_default = 1.0   # rad/s^2
 tau_omega = 0.5       # s
 az_default = 1.0      # m/s^2, ramp of the vertical velocity reference
@@ -82,12 +82,28 @@ Kp_wheel = 5e1
 Kd_wheel = 3e1
 Kp_reg = 1e2
 Kd_reg = 2e1
+# Integral term of the WBC COM task (mpc_utils QP): a_com += Ki_com * integral(COM error).
+# z only: removes the steady-state sag when the actuators are weaker than the model
+# (real robot legs ~1.3x). Integrates only while |error| < band; |integral| <= max.
+Ki_com = [0.0, 0.0, 1e2]          # 1/s^3
+com_integral_band = 0.03          # m
+com_integral_max = 0.05           # m*s
+# Integral term of the WBC base orientation task (roll/pitch only), as Ki_com on the COM task:
+# a_base += Ki_base * integral(base levelling error).
+Ki_base = 1e2                     # 1/s^3, 0 = off
+base_integral_band = 0.2          # rad
+base_integral_max = 0.3           # rad*s
+# Outer integral loop on the forward velocity (mpx_cpp_solver.plan): the MPC gets
+# v_cmd - ki_vel * integral(v - v_cmd); with a zero command this holds the takeover position.
+ki_vel = 0.5                      # 1/s, 0 = off
+vel_correction_max = 0.5          # m/s, bound of ki_vel * integral
 
 w_posture = 0.1
 posture_joint_ids = (0, 4)
 
 w_qddot = 1e-12
 w_force = 1e-4  # WBC QP force regularization; stabilizes convergence while braking
+wbc_force_reg_mpc = True  # regularize the WBC forces towards the MPC plan (False: towards zero)
 w_com = 1e0
 w_lwheel = 1e0
 w_rwheel = 1e0
@@ -140,7 +156,7 @@ def _weights(**override):
     return jnp.diag(jnp.array(list(v.values())))
 
 
-W = _weights(a_max=2.0, ac_z_max=2.0, alpha_max=2.0)
+W = _weights(w_a=1e0, a_max=5.0, ac_z_max=2.0, alpha_max=2.0)
 
 # MPC weights while standing up from transform_up (C++ node: from the takeover until the
 # COM holds at h_mpc), then W. At the end of transform_up the shins rest on the ground and

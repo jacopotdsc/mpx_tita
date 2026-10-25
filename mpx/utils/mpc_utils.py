@@ -567,8 +567,24 @@ def whole_body_interface_wheeled_legged_qp(
     qpos, qvel, desired,
     posture_mask=None,
     ref_layout=None,
+    Ki_motion=0.0,
+    com_err_integral=None,
+    force_ref=None,
+    Ki_base=0.0,
+    base_err_integral=None,
 ):
     """Wheeled-legged whole-body QP.
+
+    ``com_err_integral`` (3,) is the time integral of the CoM position error, kept by
+    the caller (this function is pure); ``Ki_motion`` (scalar or per axis) adds
+    ``Ki_motion * com_err_integral`` to the CoM task acceleration, i.e. a PID CoM task.
+    It removes the steady-state error left by actuators weaker than the model.
+    ``force_ref`` (6,) = [f_left, f_right] in the world frame, the contact forces of the
+    MPC plan: the force regularization pulls towards them instead of towards zero (zero
+    biased the vertical CoM acceleration down and dropped the MPC's force split).
+    ``base_err_integral`` (3,) is the time integral of the base roll/pitch orientation error
+    (world frame, kept by the caller); ``Ki_base * base_err_integral`` is added to the base
+    orientation task, like ``Ki_motion`` on the CoM task.
  
     Maps the MPC reference (``desired``) to actuated joint torques through a
     single inverse-dynamics QP that tracks the CoM, both wheels and the base
@@ -752,15 +768,21 @@ def whole_body_interface_wheeled_legged_qp(
         matrix_with_no_wheel = jnp.diag(jnp.asarray(posture_mask, dtype=qpos.dtype))
     S = jax.scipy.linalg.block_diag(jnp.zeros((6, 6)), matrix_with_no_wheel)   # (nv, nv)
  
+    if com_err_integral is None:
+        com_err_integral = jnp.zeros(3)
+    if base_err_integral is None:
+        base_err_integral = jnp.zeros(3)
+
     desired_qddot  = jnp.concatenate([jnp.zeros(6), des['qjntddot']])
     a_jnt_total    = desired_qddot + Kp_regulation * err_posture + Kd_regulation * err_posture_vel
-    a_com_total    = des['com_acc']    + Kp_motion * err_com    + Kd_motion * err_com_vel
+    a_com_total    = des['com_acc']    + Kp_motion * err_com    + Kd_motion * err_com_vel    + jnp.asarray(Ki_motion) * com_err_integral
     a_lwheel_total = des['lwheel_acc'] + Kp_wheel  * err_lwheel + Kd_wheel  * err_lwheel_vel
     a_rwheel_total = des['rwheel_acc'] + Kp_wheel  * err_rwheel + Kd_wheel  * err_rwheel_vel
     a_base_orientation_total = (
         des['base_alpha']
         + Kp_motion * err_base_orientation
         + Kd_motion * err_base_orientation_vel
+        + Ki_base * base_err_integral
     )
  
     # ══════════════════════════════════════════════════════════════════════
@@ -781,11 +803,15 @@ def whole_body_interface_wheeled_legged_qp(
  
     # Keep force variables strictly regularized: a nearly-zero block here made
     # the QP lose convergence during high-speed braking despite valid contacts.
+    # Regularize towards the MPC contact forces (zero if not given).
     H_force_one = w_force * jnp.eye(n_f * n_contacts)
-    f_force_one = jnp.zeros(n_f * n_contacts)
- 
+    if force_ref is None:
+        force_ref = jnp.zeros(2 * n_f * n_contacts)
+    f_force_l = -w_force * force_ref[:n_f * n_contacts]
+    f_force_r = -w_force * force_ref[n_f * n_contacts:]
+
     H = jax.scipy.linalg.block_diag(H_acc, H_force_one, H_force_one)   # (n_var, n_var)
-    f = jnp.concatenate([f_acc, f_force_one, f_force_one])             # (n_var,)
+    f = jnp.concatenate([f_acc, f_force_l, f_force_r])                 # (n_var,)
  
     # ══════════════════════════════════════════════════════════════════════
     #  6. INEQUALITY: joint position / velocity limits (linearised over dt)
@@ -941,6 +967,7 @@ def whole_body_interface_wheeled_legged_qp(
         # PD error terms feeding those requests
         err_com=err_com,
         err_com_vel=err_com_vel,
+        com_err_integral=com_err_integral,
         err_lwheel=err_lwheel,
         err_rwheel=err_rwheel,
         err_base=err_base_orientation,

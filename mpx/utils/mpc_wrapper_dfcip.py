@@ -99,7 +99,10 @@ class BatchedMPCControllerWrapper:
         dt_wbc = config.dt_wbc
         n_contacts = 1
 
-        def whole_body_control(qpos, qvel, desired):
+        Ki_com = jnp.asarray(getattr(config, 'Ki_com', [0.0, 0.0, 0.0]))
+        Ki_base = float(getattr(config, 'Ki_base', 0.0))
+
+        def whole_body_control(qpos, qvel, desired, com_err_integral, force_ref, base_err_integral):
             return mpc_utils.whole_body_interface_wheeled_legged_qp(
                 mjx_model, config.mass, config.grav, config.d,
                 contact_id, body_id, base_body_id,
@@ -111,6 +114,11 @@ class BatchedMPCControllerWrapper:
                 qpos, qvel, desired,
                 posture_mask=self._posture_mask,
                 ref_layout=self._index_variables_qp,
+                Ki_motion=Ki_com,
+                com_err_integral=com_err_integral,
+                force_ref=force_ref,
+                Ki_base=Ki_base,
+                base_err_integral=base_err_integral,
             )
 
         self._solve                = jax.jit(jax.vmap(work))
@@ -193,7 +201,7 @@ class BatchedMPCControllerWrapper:
         )
         return new_state, reference
 
-    def whole_body_run(self, state: MPCState, x0, qpos, qvel, pl_world, pr_world, dpl_world, dpr_world, com_height_target=None):
+    def whole_body_run(self, state: MPCState, x0, qpos, qvel, pl_world, pr_world, dpl_world, dpr_world, com_height_target=None, com_err_integral=None, base_err_integral=None):
         desired = self._build_desired_jit(x0, qpos, state, pl_world, pr_world, dpl_world, dpr_world)
         if com_height_target is not None:
             # ROS/Gazebo runs asynchronously and has different contact dynamics.
@@ -203,7 +211,12 @@ class BatchedMPCControllerWrapper:
             # retain their original behavior when no height target is supplied.
             desired = desired.at[:, self._index_variables_qp['com_pos'] + 2].set(com_height_target)
             desired = desired.at[:, self._index_variables_qp['com_vel'] + 2].set(0.0)
-        tau_cmd, qddot, fl, fr = self._whole_body_interface(qpos, qvel, desired)
+        if com_err_integral is None:
+            com_err_integral = jnp.zeros((desired.shape[0], 3))
+        force_ref = state.sol.grf if getattr(self.config, 'wbc_force_reg_mpc', True) else jnp.zeros_like(state.sol.grf)
+        if base_err_integral is None:
+            base_err_integral = jnp.zeros((desired.shape[0], 3))
+        tau_cmd, qddot, fl, fr = self._whole_body_interface(qpos, qvel, desired, com_err_integral, force_ref, base_err_integral)
         return state, tau_cmd, qddot, fl, fr, desired
 
     def reset(self) -> MPCState:
