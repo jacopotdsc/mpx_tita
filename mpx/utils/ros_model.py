@@ -89,10 +89,7 @@ def model_from_description(description, config):
     runtime.wheel_radius = float(radii[0])
     model.opt.gravity[:] = [0, 0, -config.grav]
     model.opt.timestep = config.dt_sim
-    data = mujoco.MjData(model)
-    data.qpos[7:] = runtime.q0
-    mujoco.mj_forward(model, data)
-    runtime.d = float(np.linalg.norm(data.geom_xpos[contacts[0]] - data.geom_xpos[contacts[1]]))
+    # The wheel track of the MPC model stays config.d (fixed, not taken from the URDF posture).
     runtime.grf_ref = np.tile([0., 0., config.grav * runtime.mass / config.n_contact], config.n_contact)
     runtime.u_ref = np.concatenate([np.zeros(3), runtime.grf_ref])
     return model, runtime

@@ -58,12 +58,13 @@ def wheeled_dfcip_dynamics(mjx_model, mass, grav, dt, x, u, t, parameter) -> jax
     v_next     = v     + dt * dv
     omega_next = omega + dt * domega
 
-    return jnp.concatenate([
+    x_next = jnp.concatenate([
         pcom_next,
         dpcom_next,
         c_next,
         jnp.array([vcz_next, theta_next, v_next, omega_next]),
     ])
+    return x_next
 
 def quadruped_srbd_dynamics(mass, inertia,inertia_inv, dt, x, u, t,parameter):
     # Extract state variables

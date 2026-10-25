@@ -3,6 +3,9 @@ import jax
 import os
 import sys
 
+# float64 before any array of this module: weights, references and model data exactly as written.
+jax.config.update("jax_enable_x64", True)
+
 dir_path = os.path.dirname(os.path.realpath(__file__))
 model_path = os.path.abspath(os.path.join(dir_path, '..')) + '/data/tita/tita.xml'
 
@@ -58,7 +61,8 @@ n_contact = len(contact_frame)
 nx = 13
 nu = 9
 mass = 27.68978  # Sum of inertial masses in the canonical tita_running.urdf
-d = 0.6  # wheel track of the MPC model (m); 0.567 from q0, 0.6 better on the real robot
+d = 0.557  # wheel track (m), fixed: transform_up stand_jpos (hip roll 0.05). MPC lever arm of the
+           # contact moments, WBC wheel acceleration references and track width task reference
 # Centroidal inertia at q0 from the aligned model, expressed in the base frame.
 inertia = jnp.array([
     [1.090008860808705, -2.6318929583168255e-05, -0.029887671948266012],
@@ -76,93 +80,112 @@ Kd = jnp.diag(jnp.tile(jnp.array([20,20,20]),n_contact))
 base_body_name = 'base_link'
 wheel_radius = 0.0925
 
-Kp_motion = 5e1
-Kd_motion = 3e1
-Kp_wheel = 5e1
-Kd_wheel = 3e1
-Kp_reg = 1e2
-Kd_reg = 2e1
-# Integral term of the WBC COM task (mpc_utils QP): a_com += Ki_com * integral(COM error).
-# z only: removes the steady-state sag when the actuators are weaker than the model
-# (real robot legs ~1.3x). Integrates only while |error| < band; |integral| <= max.
-Ki_com = [0.0, 0.0, 1e2]          # 1/s^3
-com_integral_band = 0.03          # m
-com_integral_max = 0.05           # m*s
-# Integral term of the WBC base orientation task (roll/pitch only), as Ki_com on the COM task:
-# a_base += Ki_base * integral(base levelling error).
-Ki_base = 1e2                     # 1/s^3, 0 = off
-base_integral_band = 0.2          # rad
-base_integral_max = 0.3           # rad*s
-# Outer integral loop on the forward velocity (mpx_cpp_solver.plan): the MPC gets
-# v_cmd - ki_vel * integral(v - v_cmd); with a zero command this holds the takeover position.
-ki_vel = 0.5                      # 1/s, 0 = off
-vel_correction_max = 0.5          # m/s, bound of ki_vel * integral
-
-w_posture = 0.1
+weight_phases = ("W", "W_standup")
 posture_joint_ids = (0, 4)
-
-w_qddot = 1e-12
-w_force = 1e-4  # WBC QP force regularization; stabilizes convergence while braking
 wbc_force_reg_mpc = True  # regularize the WBC forces towards the MPC plan (False: towards zero)
-w_com = 1e0
-w_lwheel = 1e0
-w_rwheel = 1e0
-w_base = 1e0
 
-# MPC cost weights
-w_pcomxy = 0e0   # CoM position in the xy plane
-w_pcomz = 2e4    # CoM height
-w_vcomxy = 3e2   # CoM velocity in the xy plane
-w_vcomz = 1e1    # CoM vertical velocity
-w_c = 0e0        # Ground-projected CoM position
-w_vcz = 0e0      # Ground-projected CoM vertical velocity
-w_theta = 0e0    # Heading
-
-w_v = 1e1        # Ground-projected CoM forward velocity
-# NOTE: was 5. With w_vcomxy=300 on WORLD-frame CoM velocity and a reference asking
-# for 5 m/s^2 braking (the pendulum delivers ~1.5), weight 5 made yawing the cheapest
-# way to cut CoM-velocity error: alpha opposed omega_ref. Since omega_ref ramps from
-# MEASURED omega, the excursion fed itself (vx 2->0, wz 0->0.6 measured 3.3 rad/s).
-# 50 removes it on the flat test set; braking also needs the WBC joint-limit relaxation
-# in mpc_utils.py or the knee-limit QP becomes infeasible.
-w_omega = 5e1    # Angular velocity
-
-# Control weights for the wheel-related inputs
-w_a = 1e-1       # Linear acceleration
-w_ac_z = 1e-1    # Vertical acceleration
-w_alpha = 1e-3   # Angular acceleration
-
-# Control weights for the ground reaction forces
-w_fcxy = 1e-7    # Horizontal forces
-w_fcz = 1e-4     # Vertical force
-w_eq = 1e6       # Equality-constraint penalty
-w_stab = w_eq    # Terminal constraint: CoM over the wheel-contact midpoint
-
-# Bounds on the wheel-related MPC inputs, |u| <= bound: an inequality constraint in the
-# MPC, penalised with w_eq like the other constraints. Defaults 100 (inactive); W and
-# W_takeover set their own. W: 2 with the reference ramps at 0.5 (mpc_utils a_default...):
-# smooth starts and stops; 1 falls braking from -0.6 m/s (Gazebo 2026-10-21).
-a_max = 100.0      # m/s^2, linear acceleration
-ac_z_max = 100.0   # m/s^2, vertical acceleration
-alpha_max = 100.0  # rad/s^2, angular acceleration
+_W_wbc = dict(
+    Kp_motion=5e1, Kd_motion=3e1,   # COM and base orientation tasks
+    Kp_wheel=5e1, Kd_wheel=3e1,     # wheel tasks
+    Kp_reg=1e2, Kd_reg=2e1,         # posture regularization
+    w_posture=0.1,
+    w_qddot=1e-12,
+    w_force=1e-4,                   # force regularization; stabilizes convergence while braking
+    w_com=1e0, w_lwheel=1e0, w_rwheel=1e0, w_base=1e0,
+    Ki_com=[0.0, 0.0, 1e2],         # 1/s^3, integral of the COM error
+    Ki_base=1e2,                    # 1/s^3, integral of the base roll/pitch error, 0 = off
+    # Track width task: internal lateral contact force F_in = Kp_track * (d - track), positive =
+    # the legs push the wheels outwards (mpc_utils, section 5). The
+    # rolling constraint cannot hold the track; in Gazebo the contacts creep inwards when driving
+    # (0.542 -> 0.499 m in the D1 drive, camber -2 -> -5.7 deg). Reference: the MPC track d.
+    w_track=1e-2,                   # 1/N^2, 0 = off (1e-2 holds the track in Gazebo)
+    Kp_track=1e3,                   # N/m
+)
+_wbc_params = dict(
+    # Integral of the COM task (Ki_com): a_com += Ki_com * integral(COM error). z only: removes the
+    # steady-state sag when the actuators are weaker than the model (real robot legs ~1.3x).
+    # Integrates only while Ki_com z > 0 and |error| < band; |integral| <= max.
+    com_integral_band=0.03,         # m
+    com_integral_max=0.05,          # m*s
+    # Integral of the base orientation task (Ki_base, roll/pitch only), as Ki_com:
+    # a_base += Ki_base * integral(base levelling error).
+    base_integral_band=0.2,         # rad
+    base_integral_max=0.3,          # rad*s
+)
+def replace(base, **changes):
+    """Copy of the dict base with the given keys replaced (key order kept); unknown keys raise."""
+    unknown = set(changes) - set(base)
+    if unknown:
+        raise KeyError(f"replace: unknown keys {sorted(unknown)}")
+    return {**base, **changes}
 
 
-def _weights(**override):
-    """MPC weight matrix from the values above, with some of them overridden by name."""
-    v = {k: override.get(k, globals()[k]) for k in (
-        'w_pcomxy', 'w_pcomz', 'w_vcomxy', 'w_vcomz', 'w_c', 'w_vcz', 'w_theta', 'w_v',
-        'w_omega', 'w_a', 'w_ac_z', 'w_alpha', 'w_fcxy', 'w_fcz', 'w_eq', 'w_stab',
-        'a_max', 'ac_z_max', 'alpha_max')}  # the last three are input bounds, not weights
-    return jnp.diag(jnp.array(list(v.values())))
+W_wbc = {
+    "W": dict(
+        weights=_W_wbc,
+        **_wbc_params
+        ),
+    "W_standup": dict(
+        weights=replace(_W_wbc, Ki_com=[0.0, 0.0, 0.0]),
+        **_wbc_params
+        ),
+}
+
+# MPC cost weights and input bounds (base values of every phase; W_mpc overrides them by name).
+# The wrapper builds the diagonal weight matrix in this key order, which is the index order the
+# cost and the Hessian read it by (objectives.wheeled_dfcip_*): do not reorder or add keys here
+# without changing them (mpc_wrapper_dfcip.weight_matrix).
+_W_mpc = dict(
+    w_pcomxy=0e0,   # CoM position in the xy plane
+    w_pcomz=2e4,    # CoM height
+    w_vcomxy=3e2,   # CoM velocity in the xy plane
+    w_vcomz=1e1,    # CoM vertical velocity
+    w_c=0e0,        # Ground-projected CoM position
+    w_vcz=0e0,      # Ground-projected CoM vertical velocity
+    w_theta=0e0,    # Heading
+    w_v=1e1,        # Ground-projected CoM forward velocity
+    # NOTE: was 5. With w_vcomxy=300 on WORLD-frame CoM velocity and a reference asking
+    # for 5 m/s^2 braking (the pendulum delivers ~1.5), weight 5 made yawing the cheapest
+    # way to cut CoM-velocity error: alpha opposed omega_ref. Since omega_ref ramps from
+    # MEASURED omega, the excursion fed itself (vx 2->0, wz 0->0.6 measured 3.3 rad/s).
+    # 50 removes it on the flat test set; braking also needs the WBC joint-limit relaxation
+    # in mpc_utils.py or the knee-limit QP becomes infeasible.
+    w_omega=5e1,    # Angular velocity
+
+    # Control weights for the wheel-related inputs
+    w_a=1e-1,       # Linear acceleration
+    w_ac_z=1e-1,    # Vertical acceleration
+    w_alpha=1e-3,   # Angular acceleration
+
+    # Control weights for the ground reaction forces
+    w_fcxy=1e-7,    # Horizontal forces
+    w_fcz=1e-4,     # Vertical force
+    w_eq=1e6,       # Equality-constraint penalty
+    w_stab=1e6,     # Terminal constraint: CoM over the wheel-contact midpoint (= w_eq)
+
+    # Bounds on the wheel-related MPC inputs, |u| <= bound: an inequality constraint in the
+    # MPC, penalised with w_eq like the other constraints. 100 = inactive; the W_mpc phases
+    # set their own. "W": 2 with the reference ramps at 0.5 (mpc_utils a_default...):
+    # smooth starts and stops; 1 falls braking from -0.6 m/s (Gazebo 2026-10-21).
+    a_max=100.0,      # m/s^2, linear acceleration
+    ac_z_max=100.0,   # m/s^2, vertical acceleration
+    alpha_max=100.0,  # rad/s^2, angular acceleration
+)
 
 
-W = _weights(w_a=1e0, a_max=5.0, ac_z_max=2.0, alpha_max=2.0)
-
-# MPC weights while standing up from transform_up (C++ node: from the takeover until the
-# COM holds at h_mpc), then W. At the end of transform_up the shins rest on the ground and
-# the CoM is ~2.7 cm behind the wheels: with W the MPC sees a falling pendulum and jerks
+# MPC, one entry per phase: "weights" = cost weights and input bounds.
+# "W_standup": while standing up from transform_up (C++ node: from the takeover until the
+# COM holds at h_mpc), then "W". At the end of transform_up the shins rest on the ground and
+# the CoM is ~2.7 cm behind the wheels: with "W" the MPC sees a falling pendulum and jerks
 # the wheels (a up to 12 m/s^2, hips swinging at 7 rad/s). A soft terminal stability and
 # weighted wheel accelerations move the wheels under the CoM while it rises
 # (Gazebo 2026-10-21: w_a 5 falls, 2-3 stands; bounds remove the ac_z chatter).
-W_takeover = _weights(w_stab=1e4, w_a=2e0, w_ac_z=1e0, w_alpha=1e-1,
-                      a_max=3.0, ac_z_max=1.0, alpha_max=1.0)
+W_mpc = {
+    "W": dict(
+        weights=replace(_W_mpc, w_a=1e0, a_max=5.0, ac_z_max=2.0, alpha_max=2.0),
+        ),
+    "W_standup": dict(
+        weights=replace(_W_mpc, w_stab=1e4, w_a=2e0, w_ac_z=1e0, w_alpha=1e-1,
+                        a_max=3.0, ac_z_max=1.0, alpha_max=1.0),
+        ),
+}

@@ -572,6 +572,9 @@ def whole_body_interface_wheeled_legged_qp(
     force_ref=None,
     Ki_base=0.0,
     base_err_integral=None,
+    w_track=0.0,
+    Kp_track=0.0,
+    track_ref=0.0,
 ):
     """Wheeled-legged whole-body QP.
 
@@ -591,10 +594,7 @@ def whole_body_interface_wheeled_legged_qp(
     orientation while enforcing rolling, floating-base dynamics, joint limits
     and friction cones.
  
-    Returns ``(tau, qddot, fl, fr, diag)``. The public wrappers
-    ``whole_body_interface_wheeled_legged_qp`` (drops ``diag``) and
-    ``whole_body_interface_wheeled_legged_qp_diag`` (keeps it) are the entry
-    points used by the controller wrappers.
+    Returns ``(tau, qddot, fl, fr)``.
     """
  
     # ══════════════════════════════════════════════════════════════════════
@@ -800,6 +800,14 @@ def whole_body_interface_wheeled_legged_qp(
     f_acc = f_acc + w_rwheel  * J_right_wheel_lin.T @ (a_rwheel_drift           - a_rwheel_total)
     f_acc = f_acc + w_base    * J_base_link_rot.T   @ (a_base_orientation_drift - a_base_orientation_total)
     f_acc = f_acc - w_posture * (S @ a_jnt_total)
+
+    # Track width: distance between the wheel centers projected on the ground; the internal force
+    # acts along the right -> left wheel direction.
+    wheels_xy = (l_wheel_center - r_wheel_center).at[2].set(0.0)
+    track = jnp.linalg.norm(wheels_xy)
+    u_track = wheels_xy / (track + 1e-9)
+    F_in = Kp_track * (track_ref - track)
+    a_track = jnp.concatenate([-0.5 * u_track, 0.5 * u_track])   # apply the force at both wheels
  
     # Keep force variables strictly regularized: a nearly-zero block here made
     # the QP lose convergence during high-speed braking despite valid contacts.
@@ -812,6 +820,8 @@ def whole_body_interface_wheeled_legged_qp(
 
     H = jax.scipy.linalg.block_diag(H_acc, H_force_one, H_force_one)   # (n_var, n_var)
     f = jnp.concatenate([f_acc, f_force_l, f_force_r])                 # (n_var,)
+    H = H.at[nv:, nv:].add(w_track * jnp.outer(a_track, a_track))
+    f = f.at[nv:].add(-w_track * F_in * a_track)
  
     # ══════════════════════════════════════════════════════════════════════
     #  6. INEQUALITY: joint position / velocity limits (linearised over dt)
@@ -944,49 +954,6 @@ def whole_body_interface_wheeled_legged_qp(
     # ══════════════════════════════════════════════════════════════════════
     tau = Ma @ qddot + ca - Jla.T @ T_l @ fl - Jra.T @ T_r @ fr
  
-    # ══════════════════════════════════════════════════════════════════════
-    #  11. DIAGNOSTICS (unused by the control law; consumed by the *_diag wrapper)
-    # ══════════════════════════════════════════════════════════════════════
-    fl_local = l_contact_frame.T @ fl   # contact frame: [tangent, lateral, normal]
-    fr_local = r_contact_frame.T @ fr
-    ineq_slack = h - G @ x              # >= 0 when satisfied
-    n_jl = 2 * nj
-    diag = dict(
-        converged=converged,
-        iters=iters,
-        # task residuals: J qddot + Jdot qdot - a_total (0 = task exactly realised)
-        res_com=J_com @ qddot + a_com_drift - a_com_total,
-        res_lwheel=J_left_wheel_lin @ qddot + a_lwheel_drift - a_lwheel_total,
-        res_rwheel=J_right_wheel_lin @ qddot + a_rwheel_drift - a_rwheel_total,
-        res_base=J_base_link_rot @ qddot + a_base_orientation_drift - a_base_orientation_total,
-        # accelerations actually requested to the QP (feedforward + PD)
-        a_com_total=a_com_total,
-        a_lwheel_total=a_lwheel_total,
-        a_rwheel_total=a_rwheel_total,
-        a_base_total=a_base_orientation_total,
-        # PD error terms feeding those requests
-        err_com=err_com,
-        err_com_vel=err_com_vel,
-        com_err_integral=com_err_integral,
-        err_lwheel=err_lwheel,
-        err_rwheel=err_rwheel,
-        err_base=err_base_orientation,
-        # constraint satisfaction
-        eq_res_norm=jnp.linalg.norm(A_eq @ x - b_eq),
-        ineq_slack_min_joint=jnp.min(jnp.concatenate([
-            ineq_slack[:n_jl],
-            ineq_slack[G.shape[0] // 2: G.shape[0] // 2 + n_jl],
-        ])),
-        # friction margins in the contact frame: [mu Fz - |Fx|, mu Fz - |Fy|, Fz - fz_min]
-        fric_margin_l=jnp.array([mu_ * fl_local[2] - jnp.abs(fl_local[0]),
-                                 mu_ * fl_local[2] - jnp.abs(fl_local[1]),
-                                 fl_local[2] - fz_min]),
-        fric_margin_r=jnp.array([mu_ * fr_local[2] - jnp.abs(fr_local[0]),
-                                 mu_ * fr_local[2] - jnp.abs(fr_local[1]),
-                                 fr_local[2] - fz_min]),
-        fl_local=fl_local,
-        fr_local=fr_local,
-    )
     return tau, qddot, fl, fr
 
 
