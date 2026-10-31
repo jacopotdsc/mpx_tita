@@ -572,6 +572,8 @@ def whole_body_interface_wheeled_legged_qp(
     force_ref=None,
     Ki_base=0.0,
     base_err_integral=None,
+    Ki_wheel=0.0,
+    wheel_err_integral=None,
     w_track=0.0,
     Kp_track=0.0,
     track_ref=0.0,
@@ -588,6 +590,9 @@ def whole_body_interface_wheeled_legged_qp(
     ``base_err_integral`` (3,) is the time integral of the base roll/pitch orientation error
     (world frame, kept by the caller); ``Ki_base * base_err_integral`` is added to the base
     orientation task, like ``Ki_motion`` on the CoM task.
+    ``wheel_err_integral`` (2, 3) = [left, right] wheel velocity deficit (world frame, m/s, kept by
+    the caller): time integral of the wheel acceleration the MPC asked and the wheels did not make
+    (e.g. lost to wheel friction); ``Ki_wheel * wheel_err_integral`` is added to the wheel tasks.
  
     Maps the MPC reference (``desired``) to actuated joint torques through a
     single inverse-dynamics QP that tracks the CoM, both wheels and the base
@@ -772,12 +777,14 @@ def whole_body_interface_wheeled_legged_qp(
         com_err_integral = jnp.zeros(3)
     if base_err_integral is None:
         base_err_integral = jnp.zeros(3)
+    if wheel_err_integral is None:
+        wheel_err_integral = jnp.zeros((2, 3))
 
     desired_qddot  = jnp.concatenate([jnp.zeros(6), des['qjntddot']])
     a_jnt_total    = desired_qddot + Kp_regulation * err_posture + Kd_regulation * err_posture_vel
     a_com_total    = des['com_acc']    + Kp_motion * err_com    + Kd_motion * err_com_vel    + jnp.asarray(Ki_motion) * com_err_integral
-    a_lwheel_total = des['lwheel_acc'] + Kp_wheel  * err_lwheel + Kd_wheel  * err_lwheel_vel
-    a_rwheel_total = des['rwheel_acc'] + Kp_wheel  * err_rwheel + Kd_wheel  * err_rwheel_vel
+    a_lwheel_total = des['lwheel_acc'] + Kp_wheel  * err_lwheel + Kd_wheel  * err_lwheel_vel + Ki_wheel * wheel_err_integral[0]
+    a_rwheel_total = des['rwheel_acc'] + Kp_wheel  * err_rwheel + Kd_wheel  * err_rwheel_vel + Ki_wheel * wheel_err_integral[1]
     a_base_orientation_total = (
         des['base_alpha']
         + Kp_motion * err_base_orientation

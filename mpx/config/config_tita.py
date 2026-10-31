@@ -92,8 +92,9 @@ _W_wbc = dict(
     w_qddot=1e-12,
     w_force=1e-4,                   # force regularization; stabilizes convergence while braking
     w_com=1e0, w_lwheel=1e0, w_rwheel=1e0, w_base=1e0,
-    Ki_com=[0.0, 0.0, 1e2],         # 1/s^3, integral of the COM error
+    Ki_com=[0.0, 0.0, 4e2],         # 1/s^3, integral of the COM error
     Ki_base=1e2,                    # 1/s^3, integral of the base roll/pitch error, 0 = off
+    Ki_wheel=0.0,                   # 1/s, integral of the wheel acceleration not made (friction), 0 = off
     # Track width task: internal lateral contact force F_in = Kp_track * (d - track), positive =
     # the legs push the wheels outwards (mpc_utils, section 5). The
     # rolling constraint cannot hold the track; in Gazebo the contacts creep inwards when driving
@@ -104,13 +105,15 @@ _W_wbc = dict(
 _wbc_params = dict(
     # Integral of the COM task (Ki_com): a_com += Ki_com * integral(COM error). z only: removes the
     # steady-state sag when the actuators are weaker than the model (real robot legs ~1.3x).
-    # Integrates only while Ki_com z > 0 and |error| < band; |integral| <= max.
-    com_integral_band=0.03,         # m
+    # Integrates only while Ki_com z > 0. No band; |integral| <= max.
     com_integral_max=0.05,          # m*s
     # Integral of the base orientation task (Ki_base, roll/pitch only), as Ki_com:
-    # a_base += Ki_base * integral(base levelling error).
-    base_integral_band=0.2,         # rad
+    # a_base += Ki_base * integral(base levelling error). No band; |integral| <= max.
     base_integral_max=0.3,          # rad*s
+    # Integral of the wheel tasks (Ki_wheel): a_wheel += Ki_wheel * deficit, deficit = integral of
+    # (wheel acceleration the MPC asked - the one the wheel made), per wheel, along the heading
+    # (mpx_cpp_solver.wbc). No band; |deficit| <= max.
+    wheel_integral_max=1.0,         # m/s
 )
 def replace(base, **changes):
     """Copy of the dict base with the given keys replaced (key order kept); unknown keys raise."""

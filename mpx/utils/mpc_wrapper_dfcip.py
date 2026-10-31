@@ -99,7 +99,8 @@ class BatchedMPCControllerWrapper:
         dt_wbc = config.dt_wbc
         n_contacts = 1
 
-        def whole_body_control(ww, qpos, qvel, desired, com_err_integral, force_ref, base_err_integral):
+        def whole_body_control(ww, qpos, qvel, desired, com_err_integral, force_ref, base_err_integral,
+                               wheel_err_integral):
             # ww: WBC gains and weights of a phase (config.W_wbc "weights"), a runtime input.
             return mpc_utils.whole_body_interface_wheeled_legged_qp(
                 mjx_model, config.mass, config.grav, config.d,
@@ -117,13 +118,15 @@ class BatchedMPCControllerWrapper:
                 force_ref=force_ref,
                 Ki_base=ww['Ki_base'],
                 base_err_integral=base_err_integral,
+                Ki_wheel=ww['Ki_wheel'],
+                wheel_err_integral=wheel_err_integral,
                 w_track=ww['w_track'], Kp_track=ww['Kp_track'],
                 track_ref=config.d,
             )
 
         self._solve                = jax.jit(jax.vmap(work))
         self._ref_gen              = jax.jit(jax.vmap(ref_gen))
-        self._whole_body_interface = jax.jit(jax.vmap(whole_body_control, in_axes=(None, 0, 0, 0, 0, 0, 0)))
+        self._whole_body_interface = jax.jit(jax.vmap(whole_body_control, in_axes=(None, 0, 0, 0, 0, 0, 0, 0)))
         self._build_desired_jit    = jax.jit(self._build_desired_impl)
         self._process_state_jit    = jax.jit(self._process_state_impl)
 
@@ -217,7 +220,7 @@ class BatchedMPCControllerWrapper:
             raise ValueError(f'MPC weights must have the keys of W_mpc["W"] in the same order: {keys}')
         return jnp.diag(jnp.array([float(weights[k]) for k in keys], dtype=jnp.float64))
 
-    def whole_body_run(self, state: MPCState, x0, qpos, qvel, pl_world, pr_world, dpl_world, dpr_world, com_height_target=None, com_err_integral=None, base_err_integral=None, phase="W", ww=None):
+    def whole_body_run(self, state: MPCState, x0, qpos, qvel, pl_world, pr_world, dpl_world, dpr_world, com_height_target=None, com_err_integral=None, base_err_integral=None, wheel_err_integral=None, phase="W", ww=None):
         """WBC with the gains ww (config.W_wbc "weights"), else those of the phase. Inside a jitted caller
         pass ww as one of its inputs (else XLA compiles it as a constant)."""
         desired = self._build_desired_jit(x0, qpos, state, pl_world, pr_world, dpl_world, dpr_world)
@@ -234,9 +237,12 @@ class BatchedMPCControllerWrapper:
         force_ref = state.sol.grf if getattr(self.config, 'wbc_force_reg_mpc', True) else jnp.zeros_like(state.sol.grf)
         if base_err_integral is None:
             base_err_integral = jnp.zeros((desired.shape[0], 3))
+        if wheel_err_integral is None:
+            wheel_err_integral = jnp.zeros((desired.shape[0], 2, 3))
         if ww is None:
             ww = self.config.W_wbc[phase]["weights"]
-        tau_cmd, qddot, fl, fr = self._whole_body_interface(ww, qpos, qvel, desired, com_err_integral, force_ref, base_err_integral)
+        tau_cmd, qddot, fl, fr = self._whole_body_interface(ww, qpos, qvel, desired, com_err_integral, force_ref, base_err_integral,
+                                                              wheel_err_integral)
         return state, tau_cmd, qddot, fl, fr, desired
 
     def reset(self) -> MPCState:
