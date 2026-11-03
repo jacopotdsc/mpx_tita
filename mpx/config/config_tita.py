@@ -101,6 +101,16 @@ _W_wbc = dict(
     # (0.542 -> 0.499 m in the D1 drive, camber -2 -> -5.7 deg). Reference: the MPC track d.
     w_track=1e-2,                   # 1/N^2, 0 = off (1e-2 holds the track in Gazebo)
     Kp_track=1e3,                   # N/m
+    # Identified joint friction added to the WBC torques (mpc_utils, section 10):
+    # tau += friction_comp * (Im*qddot + Fc*tanh(qdot/fric_eps) + Fv*qdot), per joint in joints_name
+    # order. Values (2026-11-01): friction_test, smooth strokes with sensor noise, Butterworth, all samples
+    # (scripts/data_identification_smooth_noise/parameters.yaml); Gazebo truth: legs Fc 1.0, Fv 0.1,
+    # wheels 0.3, 0.02 (robot_gazebo_joint_friction.xacro of test_results/friction_video_2026_11_01).
+    friction_comp=0.0,              # 0 = off, 1 = on
+    fric_Fc=[0.8953, 0.9299, 0.9167, 0.2979, 0.8895, 0.9279, 0.9133, 0.2980],  # N*m
+    fric_Fv=[0.4786, 0.3333, 0.3082, 0.0204, 0.4929, 0.3457, 0.3205, 0.0204],  # N*m*s/rad
+    fric_Im=[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],                          # kg*m^2
+    fric_eps=0.05,                  # rad/s, width of the smooth Coulomb sign
 )
 _wbc_params = dict(
     # Integral of the COM task (Ki_com): a_com += Ki_com * integral(COM error). z only: removes the

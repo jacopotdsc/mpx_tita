@@ -122,6 +122,9 @@ class BatchedMPCControllerWrapper:
                 wheel_err_integral=wheel_err_integral,
                 w_track=ww['w_track'], Kp_track=ww['Kp_track'],
                 track_ref=config.d,
+                friction_comp=ww['friction_comp'],
+                fric_Fc=ww['fric_Fc'], fric_Fv=ww['fric_Fv'], fric_Im=ww['fric_Im'],
+                fric_eps=ww['fric_eps'],
             )
 
         self._solve                = jax.jit(jax.vmap(work))

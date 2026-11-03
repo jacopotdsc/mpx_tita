@@ -577,6 +577,11 @@ def whole_body_interface_wheeled_legged_qp(
     w_track=0.0,
     Kp_track=0.0,
     track_ref=0.0,
+    friction_comp=0.0,
+    fric_Fc=None,
+    fric_Fv=None,
+    fric_Im=None,
+    fric_eps=0.05,
 ):
     """Wheeled-legged whole-body QP.
 
@@ -593,6 +598,10 @@ def whole_body_interface_wheeled_legged_qp(
     ``wheel_err_integral`` (2, 3) = [left, right] wheel velocity deficit (world frame, m/s, kept by
     the caller): time integral of the wheel acceleration the MPC asked and the wheels did not make
     (e.g. lost to wheel friction); ``Ki_wheel * wheel_err_integral`` is added to the wheel tasks.
+    ``friction_comp`` (0 = off, 1 = on) adds the identified joint friction to the output torques,
+    per actuated joint (``fric_*`` (nj,), joint order of qvel[6:]):
+    ``Im * qddot + Fc * tanh(qdot / fric_eps) + Fv * qdot`` (qdot measured, qddot from the QP).
+    The QP does not change: the actuated rows of the dynamics only give the torques.
  
     Maps the MPC reference (``desired``) to actuated joint torques through a
     single inverse-dynamics QP that tracks the CoM, both wheels and the base
@@ -960,6 +969,11 @@ def whole_body_interface_wheeled_legged_qp(
     #  10. INVERSE DYNAMICS -> actuated torques
     # ══════════════════════════════════════════════════════════════════════
     tau = Ma @ qddot + ca - Jla.T @ T_l @ fl - Jra.T @ T_r @ fr
+    # Identified joint friction and rotor inertia (friction_comp 0 = off).
+    if fric_Fc is not None:
+        tau = tau + friction_comp * (jnp.asarray(fric_Im) * qddot[6:]
+                                     + jnp.asarray(fric_Fc) * jnp.tanh(qdot_jnt / fric_eps)
+                                     + jnp.asarray(fric_Fv) * qdot_jnt)
  
     return tau, qddot, fl, fr
 
