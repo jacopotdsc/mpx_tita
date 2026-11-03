@@ -93,8 +93,8 @@ _W_wbc = dict(
     w_force=1e-4,                   # force regularization; stabilizes convergence while braking
     w_com=1e0, w_lwheel=1e0, w_rwheel=1e0, w_base=1e0,
     Ki_com=[0.0, 0.0, 4e2],         # 1/s^3, integral of the COM error
-    Ki_base=1e2,                    # 1/s^3, integral of the base roll/pitch error, 0 = off
-    Ki_wheel=0.0,                   # 1/s, integral of the wheel acceleration not made (friction), 0 = off
+    Ki_base=0e2,                    # 1/s^3, integral of the base roll/pitch error, 0 = off
+    Ki_wheel=10.0,                   # 1/s, integral of the wheel acceleration not made (friction), 0 = off
     # Track width task: internal lateral contact force F_in = Kp_track * (d - track), positive =
     # the legs push the wheels outwards (mpc_utils, section 5). The
     # rolling constraint cannot hold the track; in Gazebo the contacts creep inwards when driving
@@ -125,11 +125,11 @@ def replace(base, **changes):
 
 W_wbc = {
     "W": dict(
-        weights=_W_wbc,
+        weights=replace(_W_wbc, Kd_motion=3e1, Ki_com=[0.0, 0.0, 0.0]),
         **_wbc_params
         ),
     "W_standup": dict(
-        weights=replace(_W_wbc, Ki_com=[0.0, 0.0, 0.0]),
+        weights=replace(_W_wbc, Kd_motion=3e1, Ki_com=[0.0, 0.0, 0.0]),
         **_wbc_params
         ),
 }
@@ -185,7 +185,8 @@ _W_mpc = dict(
 # (Gazebo 2026-10-21: w_a 5 falls, 2-3 stands; bounds remove the ac_z chatter).
 W_mpc = {
     "W": dict(
-        weights=replace(_W_mpc, w_a=1e0, a_max=5.0, ac_z_max=2.0, alpha_max=2.0),
+        weights=replace(_W_mpc, w_stab=1e4, w_a=2e0, w_ac_z=1e0, w_alpha=1e-1,
+                        a_max=3.0, ac_z_max=1.0, alpha_max=1.0),
         ),
     "W_standup": dict(
         weights=replace(_W_mpc, w_stab=1e4, w_a=2e0, w_ac_z=1e0, w_alpha=1e-1,
