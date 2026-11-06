@@ -1,6 +1,7 @@
 import jax
 import math
 import jax.numpy as jnp
+import numpy as np
 from functools import partial
 from flax import struct
 import mpx.utils.mpc_utils as mpc_utils
@@ -40,9 +41,11 @@ class BatchedMPCControllerWrapper:
 
         self.mpc_frequency = config.mpc_frequency
         shift = 1.0 / (config.mpc_frequency * config.dt_mpc)
-        if not math.isfinite(shift) or abs(shift - round(shift)) > 1e-6 or not 1 <= round(shift) <= config.N:
-            raise ValueError('MPC period must span a whole number of prediction nodes within the horizon')
-        self.shift = int(round(shift))
+        # MPC period in prediction nodes; it may be fractional (e.g. 50 Hz with dt_mpc 25 ms = 0.8
+        # nodes): the warm start and the reference continuation are then linearly interpolated.
+        if not math.isfinite(shift) or not 0. < shift <= config.N:
+            raise ValueError('MPC period must be positive and within the prediction horizon')
+        self.shift = round(shift) if abs(shift - round(shift)) < 1e-9 else shift
         self.mpc_iterations = int(getattr(config, "mpc_iterations", 1))
         self.wbc_lookahead_dt = float(getattr(config, "wbc_lookahead_dt", 0.0))
 
@@ -167,12 +170,25 @@ class BatchedMPCControllerWrapper:
     def process_state(self, pcom, vcom, centers, Rs, radii, feet_vel, theta_prev):
         return self._process_state_jit(pcom, vcom, centers, Rs, radii, feet_vel, theta_prev)
 
+    def _interp_nodes(self, trajectory, points):
+        """trajectory[:, points] along axis 1 with linear interpolation between nodes; points past
+        the last node hold the terminal value. Whole points give exactly trajectory[:, k]."""
+        last = trajectory.shape[1] - 1
+        points = np.minimum(np.asarray(points, dtype=float), last)
+        i0 = np.floor(points).astype(int)
+        i1 = np.minimum(i0 + 1, last)
+        w = (points - i0).reshape((1, -1) + (1,) * (trajectory.ndim - 2))
+        return trajectory[:, i0] * (1. - w) + trajectory[:, i1] * w
+
     @partial(jax.jit, static_argnums=(0,))
     def shift_warm_start(self, trajectory):
-        """Advance the solver guess by whole nodes and hold the terminal value."""
-        s = self.shift
-        return jnp.concatenate([trajectory[:, s:, :],
-                                jnp.tile(trajectory[:, -1:, :], (1, s, 1))], axis=1)
+        """Advance the solver guess by one MPC period (self.shift nodes, possibly fractional)
+        and hold the terminal value."""
+        return self._interp_nodes(trajectory, np.arange(trajectory.shape[1]) + self.shift)
+
+    def rate_ahead(self, rates):
+        """Reference rates one MPC period ahead: where the next solve continues the profile."""
+        return self._interp_nodes(rates, [self.shift])[:, 0]
 
     def run(self, state: MPCState, x0, cmd, phase="W") -> MPCState:
         cfg = self.config
@@ -198,7 +214,7 @@ class BatchedMPCControllerWrapper:
             X0_shifted=new_X0,
             U0_shifted=new_U0,
             D0_shifted=new_D0,
-            ref_rate=rates[:, self.shift],  # one MPC period ahead
+            ref_rate=self.rate_ahead(rates),  # one MPC period ahead
         )
         return new_state, reference
 

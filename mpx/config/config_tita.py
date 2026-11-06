@@ -19,7 +19,7 @@ body_name = ['left_leg_4', 'right_leg_4']
 
 simulation_frequency = 500
 whole_body_frequency = 100
-mpc_frequency = 40
+mpc_frequency = 50
 dt_mpc = 0.025
 N = 12
 mpc_horizon_s = N * dt_mpc
@@ -30,7 +30,7 @@ dt_sim = 1.0 / simulation_frequency
 dt_wbc = 1.0 / whole_body_frequency
 mpc_period_steps = simulation_frequency / mpc_frequency
 wbc_period_steps = round(simulation_frequency / whole_body_frequency)
-mpc_shift_nodes = round(1.0 / (mpc_frequency * dt_mpc))
+mpc_shift_nodes = 1.0 / (mpc_frequency * dt_mpc)  # may be fractional (interpolated warm start)
 
 T_TRAJECTORY = 60
 grav = 9.81
