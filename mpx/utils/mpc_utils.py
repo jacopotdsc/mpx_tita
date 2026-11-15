@@ -549,6 +549,66 @@ def get_rCP(wheel_R, radius):
     s = a / jnp.linalg.norm(a)
     return -s * radius
 
+def err_rotation(Ra, Rb):
+    """Angle-axis orientation error of Ra w.r.t. Rb (faithful Eigen AngleAxis port)."""
+    Rdiff = Rb.T @ Ra
+    cos_angle = jnp.clip((jnp.trace(Rdiff) - 1.0) / 2.0, -1.0, 1.0)
+    angle = jnp.arccos(cos_angle)
+    skew_vec = jnp.array([
+        Rdiff[2, 1] - Rdiff[1, 2],
+        Rdiff[0, 2] - Rdiff[2, 0],
+        Rdiff[1, 0] - Rdiff[0, 1],
+    ]) * 0.5
+    axis_norm = jnp.linalg.norm(skew_vec)
+    safe_norm = jnp.where(axis_norm < 1e-7, 1.0, axis_norm)
+    axis = skew_vec / safe_norm
+    err = angle * (Ra @ axis)
+    return jnp.where(angle < 1e-7, jnp.zeros(3), err)
+
+def wbc_integral_update(integral, desired_com_z, pcom_z, base_quat, theta, wheel_vel_world,
+                        a, alpha, d, dt, wp, Ki_com_z, Ki_base, Ki_wheel):
+    """One WBC step of the integral memory (one robot, pure): returns the updated ``integral``.
+
+    ``integral`` has the fields of mpc_wrapper_dfcip.WBCIntegral (one robot). Rule per term: gain
+    0 -> its integral is 0; gain != 0 -> it integrates and keeps its value (the reset at a phase
+    change is done by the caller, mpc_wrapper_dfcip.whole_body_run). No band; each integral is bounded only by its maximum in ``wp`` (config W_wbc entry).
+    - com: z = integral of (COM height target - measured COM height); x, y stay 0 (the
+      horizontal COM target comes from the MPC).
+    - base: integral of the base roll/pitch error, angle-axis (``err_rotation``) with the target
+      = the base levelled at its own yaw; the yaw component is 0 (heading is the MPC's job).
+    - wheel: per wheel [left, right], time integral of the acceleration along the heading the MPC
+      asked at the previous step (a -/+ alpha d/2) minus the one the wheel made since then (the
+      planned wheel motion lost to friction). Skipped at the first step after a reset (primed 0).
+    ``base_quat`` (w, x, y, z); ``theta`` heading (process_state: heading = axle x z);
+    ``wheel_vel_world`` (2, 3); ``a``, ``alpha`` the MPC input the QP tracks at this step.
+    """
+    com_max, base_max, wheel_max = wp['com_integral_max'], wp['base_integral_max'], wp['wheel_integral_max']
+
+    com_z = jnp.clip(integral.com[2] + (desired_com_z - pcom_z) * dt, -com_max, com_max)
+    com = integral.com.at[2].set(jnp.where(Ki_com_z != 0, com_z, 0.0))
+
+    Rb = math.quat_to_mat(base_quat / jnp.linalg.norm(base_quat))
+    yaw = jnp.arctan2(Rb[1, 0], Rb[0, 0])
+    cy, sy = jnp.cos(yaw), jnp.sin(yaw)
+    Ra = jnp.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
+    err_base = err_rotation(Ra, Rb).at[2].set(0.0)
+    base = jnp.where(Ki_base != 0, jnp.clip(integral.base + err_base * dt, -base_max, base_max), 0.0)
+
+    heading = jnp.array([jnp.cos(theta), jnp.sin(theta), 0.0])
+    wheel_v = wheel_vel_world @ heading
+    a_done = (wheel_v - integral.wheel_v_prev) / dt
+    step = jnp.where(integral.primed > 0.5, (integral.wheel_a_asked - a_done) * dt, 0.0)
+    wheel = jnp.where(Ki_wheel != 0, jnp.clip(integral.wheel + step, -wheel_max, wheel_max), 0.0)
+    # wheel_v_prev / wheel_a_asked are updated at every step (also with Ki_wheel 0), so the deficit
+    # starts from a valid previous speed when Ki_wheel becomes non-zero.
+
+    return integral.replace(
+        com=com, base=base, wheel=wheel,
+        wheel_v_prev=wheel_v,
+        wheel_a_asked=jnp.stack([a - alpha * d / 2.0, a + alpha * d / 2.0]),
+        primed=jnp.ones_like(integral.primed),
+    )
+
 def whole_body_interface_wheeled_legged_qp(
     mjx_model,
     # ── static (bound via functools.partial) ──────────────────────────────
@@ -580,18 +640,18 @@ def whole_body_interface_wheeled_legged_qp(
 ):
     """Wheeled-legged whole-body QP.
 
-    ``com_err_integral`` (3,) is the time integral of the CoM position error, kept by
-    the caller (this function is pure); ``Ki_motion`` (scalar or per axis) adds
+    ``com_err_integral`` (3,) is the time integral of the CoM position error, kept in
+    MPCState.integral by the wrapper (wbc_integral_update; this function is pure);``Ki_motion`` (scalar or per axis) adds
     ``Ki_motion * com_err_integral`` to the CoM task acceleration, i.e. a PID CoM task.
     It removes the steady-state error left by actuators weaker than the model.
     ``force_ref`` (6,) = [f_left, f_right] in the world frame, the contact forces of the
     MPC plan: the force regularization pulls towards them instead of towards zero (zero
     biased the vertical CoM acceleration down and dropped the MPC's force split).
     ``base_err_integral`` (3,) is the time integral of the base roll/pitch orientation error
-    (world frame, kept by the caller); ``Ki_base * base_err_integral`` is added to the base
+    (world frame, kept in MPCState.integral by the wrapper); ``Ki_base * base_err_integral`` is added to the base
     orientation task, like ``Ki_motion`` on the CoM task.
-    ``wheel_err_integral`` (2, 3) = [left, right] wheel velocity deficit (world frame, m/s, kept by
-    the caller): time integral of the wheel acceleration the MPC asked and the wheels did not make
+    ``wheel_err_integral`` (2, 3) = [left, right] wheel velocity deficit (world frame, m/s, kept in
+    MPCState.integral by the wrapper): time integral of the wheel acceleration the MPC asked and the wheels did not make
     (e.g. lost to wheel friction); ``Ki_wheel * wheel_err_integral`` is added to the wheel tasks.
  
     Maps the MPC reference (``desired``) to actuated joint torques through a
@@ -613,21 +673,6 @@ def whole_body_interface_wheeled_legged_qp(
             [-v[1], v[0],  0.0],
         ])
  
-    def err_rotation(Ra, Rb):
-        """Angle-axis orientation error of Ra w.r.t. Rb (faithful Eigen AngleAxis port)."""
-        Rdiff = Rb.T @ Ra
-        cos_angle = jnp.clip((jnp.trace(Rdiff) - 1.0) / 2.0, -1.0, 1.0)
-        angle = jnp.arccos(cos_angle)
-        skew_vec = jnp.array([
-            Rdiff[2, 1] - Rdiff[1, 2],
-            Rdiff[0, 2] - Rdiff[2, 0],
-            Rdiff[1, 0] - Rdiff[0, 1],
-        ]) * 0.5
-        axis_norm = jnp.linalg.norm(skew_vec)
-        safe_norm = jnp.where(axis_norm < 1e-7, 1.0, axis_norm)
-        axis = skew_vec / safe_norm
-        err = angle * (Ra @ axis)
-        return jnp.where(angle < 1e-7, jnp.zeros(3), err)
  
     def compute_virtual_frame(wheel_R):
         """Virtual wheel frame [t, n, s]; n is the axle direction, s the ground-projected up."""

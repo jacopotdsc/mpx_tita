@@ -21,6 +21,19 @@ class ControlSol:
 
 
 @struct.dataclass
+class WBCIntegral:
+    """Memory of the WBC integral terms (Ki_com, Ki_base, Ki_wheel), one row per robot.
+    Updated by whole_body_run (mpc_utils.wbc_integral_update); zero after init_state()."""
+    com           : jax.Array   # (n, 3) integral of the COM error (z only), m*s
+    base          : jax.Array   # (n, 3) integral of the base roll/pitch error (world), rad*s
+    wheel         : jax.Array   # (n, 2) [left, right] wheel velocity deficit along the heading, m/s
+    wheel_v_prev  : jax.Array   # (n, 2) wheel speeds along the heading at the previous WBC step
+    wheel_a_asked : jax.Array   # (n, 2) wheel accelerations the MPC asked at the previous WBC step
+    primed        : jax.Array   # (n,) 0 until the first WBC step (no previous wheel speed yet)
+    phase         : jax.Array   # (n,) weight phase of the previous WBC step (index in config.weight_phases)
+
+
+@struct.dataclass
 class MPCState:
     """Tutto lo stato mutabile dell'MPC in un pytree JAX (compatibile con jax.vmap)."""
     sol        : ControlSol
@@ -28,6 +41,7 @@ class MPCState:
     U0_shifted : jax.Array
     D0_shifted : jax.Array
     ref_rate   : jax.Array   # [v, acc_v, omega, acc_omega] the next reference starts from
+    integral   : WBCIntegral  # WBC integral memory (carried unchanged by the MPC)
 
 
 class BatchedMPCControllerWrapper:
@@ -102,10 +116,25 @@ class BatchedMPCControllerWrapper:
         dt_wbc = config.dt_wbc
         n_contacts = 1
 
-        def whole_body_control(ww, qpos, qvel, desired, com_err_integral, force_ref, base_err_integral,
-                               wheel_err_integral):
-            # ww: WBC gains and weights of a phase (config.W_wbc "weights"), a runtime input.
-            return mpc_utils.whole_body_interface_wheeled_legged_qp(
+        def whole_body_control(ww, wp, phase_id, qpos, qvel, desired, force_ref, integral, x0, wheel_vel, a, alpha):
+            # ww: WBC gains and weights of a phase (config.W_wbc "weights"), a runtime input;
+            # wp: the integral limits of the phase (config.W_wbc *_integral_max), a runtime input;
+            # phase_id: index of the phase in config.weight_phases, a runtime input.
+            # One robot: update the integral memory on this step's state, then the QP.
+            # Phase change (weights change): every integral restarts from 0.
+            changed = (integral.primed > 0.5) & (integral.phase != phase_id)
+            integral = integral.replace(
+                com=jnp.where(changed, 0.0, integral.com),
+                base=jnp.where(changed, 0.0, integral.base),
+                wheel=jnp.where(changed, 0.0, integral.wheel),
+                phase=jnp.asarray(phase_id, dtype=integral.phase.dtype))
+            theta = x0[10]
+            integral = mpc_utils.wbc_integral_update(
+                integral, desired[self._index_variables_qp['com_pos'] + 2], x0[2], qpos[3:7], theta,
+                wheel_vel, a, alpha, config.d, dt_wbc, wp,
+                jnp.asarray(ww['Ki_com'])[2], ww['Ki_base'], ww['Ki_wheel'])
+            heading = jnp.array([jnp.cos(theta), jnp.sin(theta), 0.0])
+            tau, qddot, fl, fr = mpc_utils.whole_body_interface_wheeled_legged_qp(
                 mjx_model, config.mass, config.grav, config.d,
                 contact_id, body_id, base_body_id,
                 config.wheel_radius, dt_wbc, n_contacts,
@@ -117,19 +146,20 @@ class BatchedMPCControllerWrapper:
                 posture_mask=self._posture_mask,
                 ref_layout=self._index_variables_qp,
                 Ki_motion=ww['Ki_com'],
-                com_err_integral=com_err_integral,
+                com_err_integral=integral.com,
                 force_ref=force_ref,
                 Ki_base=ww['Ki_base'],
-                base_err_integral=base_err_integral,
+                base_err_integral=integral.base,
                 Ki_wheel=ww['Ki_wheel'],
-                wheel_err_integral=wheel_err_integral,
+                wheel_err_integral=jnp.outer(integral.wheel, heading),
                 w_track=ww['w_track'], Kp_track=ww['Kp_track'],
                 track_ref=config.d,
             )
+            return tau, qddot, fl, fr, integral
 
         self._solve                = jax.jit(jax.vmap(work))
         self._ref_gen              = jax.jit(jax.vmap(ref_gen))
-        self._whole_body_interface = jax.jit(jax.vmap(whole_body_control, in_axes=(None, 0, 0, 0, 0, 0, 0, 0)))
+        self._whole_body_interface = jax.jit(jax.vmap(whole_body_control, in_axes=(None, None, None, 0, 0, 0, 0, 0, 0, 0, 0, 0)))
         self._build_desired_jit    = jax.jit(self._build_desired_impl)
         self._process_state_jit    = jax.jit(self._process_state_impl)
 
@@ -165,7 +195,15 @@ class BatchedMPCControllerWrapper:
             U0_shifted=self._U0_init,
             D0_shifted=self._D0_init,
             ref_rate=ref_rate,
+            integral=self.init_integral(),
         )
+
+    def init_integral(self) -> WBCIntegral:
+        """WBC integral memory at zero (no previous wheel speed: the first step only primes it)."""
+        n = self.n_env
+        return WBCIntegral(com=jnp.zeros((n, 3)), base=jnp.zeros((n, 3)), wheel=jnp.zeros((n, 2)),
+                           wheel_v_prev=jnp.zeros((n, 2)), wheel_a_asked=jnp.zeros((n, 2)),
+                           primed=jnp.zeros((n,)), phase=jnp.zeros((n,)))
 
     def process_state(self, pcom, vcom, centers, Rs, radii, feet_vel, theta_prev):
         return self._process_state_jit(pcom, vcom, centers, Rs, radii, feet_vel, theta_prev)
@@ -215,6 +253,7 @@ class BatchedMPCControllerWrapper:
             U0_shifted=new_U0,
             D0_shifted=new_D0,
             ref_rate=self.rate_ahead(rates),  # one MPC period ahead
+            integral=state.integral,
         )
         return new_state, reference
 
@@ -236,9 +275,14 @@ class BatchedMPCControllerWrapper:
             raise ValueError(f'MPC weights must have the keys of W_mpc["W"] in the same order: {keys}')
         return jnp.diag(jnp.array([float(weights[k]) for k in keys], dtype=jnp.float64))
 
-    def whole_body_run(self, state: MPCState, x0, qpos, qvel, pl_world, pr_world, dpl_world, dpr_world, com_height_target=None, com_err_integral=None, base_err_integral=None, wheel_err_integral=None, phase="W", ww=None):
-        """WBC with the gains ww (config.W_wbc "weights"), else those of the phase. Inside a jitted caller
-        pass ww as one of its inputs (else XLA compiles it as a constant)."""
+    def whole_body_run(self, state: MPCState, x0, qpos, qvel, pl_world, pr_world, dpl_world, dpr_world, com_height_target=None, phase="W", ww=None, wp=None, phase_id=None):
+        """WBC with the gains ww (config.W_wbc "weights") and the integral limits wp (config.W_wbc
+        com/base/wheel_integral_max), else those of the phase; phase_id = index of the phase in
+        config.weight_phases, else that of phase. Inside a jitted caller pass ww, wp and phase_id as
+        inputs (else XLA compiles them as constants).
+        Updates the integral memory (state.integral) on this step's state before the QP and returns
+        it in the returned state: keep that state for the next WBC step. Rule: gain 0 -> integral 0;
+        when phase_id changes from the previous step every integral restarts from 0."""
         desired = self._build_desired_jit(x0, qpos, state, pl_world, pr_world, dpl_world, dpr_world)
         if com_height_target is not None:
             # ROS/Gazebo runs asynchronously and has different contact dynamics.
@@ -248,18 +292,25 @@ class BatchedMPCControllerWrapper:
             # retain their original behavior when no height target is supplied.
             desired = desired.at[:, self._index_variables_qp['com_pos'] + 2].set(com_height_target)
             desired = desired.at[:, self._index_variables_qp['com_vel'] + 2].set(0.0)
-        if com_err_integral is None:
-            com_err_integral = jnp.zeros((desired.shape[0], 3))
         force_ref = state.sol.grf if getattr(self.config, 'wbc_force_reg_mpc', True) else jnp.zeros_like(state.sol.grf)
-        if base_err_integral is None:
-            base_err_integral = jnp.zeros((desired.shape[0], 3))
-        if wheel_err_integral is None:
-            wheel_err_integral = jnp.zeros((desired.shape[0], 2, 3))
         if ww is None:
             ww = self.config.W_wbc[phase]["weights"]
-        tau_cmd, qddot, fl, fr = self._whole_body_interface(ww, qpos, qvel, desired, com_err_integral, force_ref, base_err_integral,
-                                                              wheel_err_integral)
-        return state, tau_cmd, qddot, fl, fr, desired
+        if wp is None:
+            wp = self.integral_limits(phase)
+        if phase_id is None:
+            phase_id = list(self.config.weight_phases).index(phase)
+        B = desired.shape[0]
+        x0_b = jnp.broadcast_to(jnp.atleast_2d(x0), (B, jnp.shape(x0)[-1]))
+        wheel_vel = jnp.stack([dpl_world, dpr_world], axis=1)  # (B, 2, 3)
+        tau_cmd, qddot, fl, fr, integral = self._whole_body_interface(
+            ww, wp, jnp.asarray(phase_id, dtype=jnp.float64), qpos, qvel, desired, force_ref, state.integral, x0_b, wheel_vel,
+            state.sol.a, state.sol.alpha)
+        return state.replace(integral=integral), tau_cmd, qddot, fl, fr, desired
+
+    def integral_limits(self, phase="W"):
+        """Integral limits of a phase (config.W_wbc entry), the wp input of whole_body_run."""
+        p = self.config.W_wbc[phase]
+        return {k: float(p[k]) for k in ("com_integral_max", "base_integral_max", "wheel_integral_max")}
 
     def reset(self) -> MPCState:
         print("MPC Controller Reset")
