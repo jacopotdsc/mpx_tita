@@ -30,7 +30,7 @@ dt_sim = 1.0 / simulation_frequency
 dt_wbc = 1.0 / whole_body_frequency
 mpc_period_steps = simulation_frequency / mpc_frequency
 wbc_period_steps = round(simulation_frequency / whole_body_frequency)
-mpc_shift_nodes = 1.0 / (mpc_frequency * dt_mpc)  # may be fractional (interpolated warm start)
+mpc_shift_nodes = round(1.0 / (mpc_frequency * dt_mpc))
 
 T_TRAJECTORY = 60
 grav = 9.81
@@ -92,9 +92,9 @@ _W_wbc = dict(
     w_qddot=1e-12,
     w_force=1e-4,                   # force regularization; stabilizes convergence while braking
     w_com=1e0, w_lwheel=1e0, w_rwheel=1e0, w_base=1e0,
-    Ki_com=[0.0, 0.0, 1e2],         # 1/s^3, integral of the COM error
-    Ki_base=2e1,                    # 1/s^3, integral of the base roll/pitch error, 0 = off
-    Ki_wheel=1e1,                   # 1/s, integral of the wheel acceleration not made (friction), 0 = off
+    Ki_com=[0.0, 0.0, 0e2],         # 1/s^3, integral of the COM error
+    Ki_base=0e2,                    # 1/s^3, integral of the base roll/pitch error, 0 = off
+    Ki_wheel=10.0,                   # 1/s, integral of the wheel acceleration not made (friction), 0 = off
     # Track width task: internal lateral contact force F_in = Kp_track * (d - track), positive =
     # the legs push the wheels outwards (mpc_utils, section 5). The
     # rolling constraint cannot hold the track; in Gazebo the contacts creep inwards when driving
@@ -105,16 +105,14 @@ _W_wbc = dict(
 _wbc_params = dict(
     # Integral of the COM task (Ki_com): a_com += Ki_com * integral(COM error). z only: removes the
     # steady-state sag when the actuators are weaker than the model (real robot legs ~1.3x).
-    # Rule for every integral: gain 0 -> integral 0; gain != 0 -> it integrates and keeps its value;
-    # at every phase change (weights change) every integral restarts from 0. Memory in MPCState.integral, update in
-    # mpc_utils.wbc_integral_update. No band; |integral| <= max.
+    # Integrates only while Ki_com z > 0. No band; |integral| <= max.
     com_integral_max=0.05,          # m*s
     # Integral of the base orientation task (Ki_base, roll/pitch only), as Ki_com:
     # a_base += Ki_base * integral(base levelling error). No band; |integral| <= max.
     base_integral_max=0.3,          # rad*s
     # Integral of the wheel tasks (Ki_wheel): a_wheel += Ki_wheel * deficit, deficit = integral of
     # (wheel acceleration the MPC asked - the one the wheel made), per wheel, along the heading
-    # (mpc_utils.wbc_integral_update). No band; |deficit| <= max.
+    # (mpx_cpp_solver.wbc). No band; |deficit| <= max.
     wheel_integral_max=1.0,         # m/s
 )
 def replace(base, **changes):
@@ -127,11 +125,11 @@ def replace(base, **changes):
 
 W_wbc = {
     "W": dict(
-        weights=replace(_W_wbc),
+        weights=replace(_W_wbc, Kd_motion=3e1, Ki_com=[0.0, 0.0, 1e2]),
         **_wbc_params
         ),
     "W_standup": dict(
-        weights=replace(_W_wbc, Ki_com=[0.0, 0.0, 5e1], Ki_base=0e0),
+        weights=replace(_W_wbc, Kd_motion=3e1, Ki_com=[0.0, 0.0, 0.0]),
         **_wbc_params
         ),
 }
