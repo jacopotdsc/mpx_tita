@@ -24,7 +24,9 @@ class ControlSol:
 class WBCIntegral:
     """Memory of the WBC integral terms (Ki_com, Ki_base, Ki_wheel), one row per robot.
     Updated by whole_body_run (mpc_utils.wbc_integral_update); zero after init_state()."""
-    com           : jax.Array   # (n, 3) integral of the COM error (z only), m*s
+    com           : jax.Array   # (n, 3) vertical COM velocity deficit (z only, x, y = 0), m/s
+    com_vz_prev   : jax.Array   # (n,) vertical COM velocity at the previous WBC step
+    com_az_asked  : jax.Array   # (n,) vertical COM acceleration the MPC asked at the previous WBC step
     base          : jax.Array   # (n, 3) integral of the base roll/pitch error (world), rad*s
     wheel         : jax.Array   # (n, 2) [left, right] wheel velocity deficit along the heading, m/s
     wheel_v_prev  : jax.Array   # (n, 2) wheel speeds along the heading at the previous WBC step
@@ -40,7 +42,7 @@ class MPCState:
     X0_shifted : jax.Array
     U0_shifted : jax.Array
     D0_shifted : jax.Array
-    ref_rate   : jax.Array   # [v, acc_v, omega, acc_omega] the next reference starts from
+    ref_rate   : jax.Array   # [v_prof, v_ref, omega_prof, omega_ref, z_prof, vz_prof, z_ref]: profiles and references the next solve continues
     integral   : WBCIntegral  # WBC integral memory (carried unchanged by the MPC)
 
 
@@ -105,7 +107,7 @@ class BatchedMPCControllerWrapper:
         fddp     = partial(optimizers.fddp_mpc, cost, dynamics, hess, False)
         ref_gen  = partial(mpc_utils.reference_generator_dfcip_online, config.N, config.dt_mpc, config.mass, config.grav, config.h_min, config.h_max,
                            config.a_default, config.tau_v,
-                           config.alpha_default, config.tau_omega, config.az_default)
+                           config.alpha_default, config.tau_omega, config.tau_z, config.vz_max)
 
         def work(reference, parameter, W, x0, X_init, U_init):
             X_it, U_it, D_it = X_init, U_init, None
@@ -129,8 +131,10 @@ class BatchedMPCControllerWrapper:
                 wheel=jnp.where(changed, 0.0, integral.wheel),
                 phase=jnp.asarray(phase_id, dtype=integral.phase.dtype))
             theta = x0[10]
+            # Vertical COM: asked = CoM task feedforward z ((f_L + f_R)_z / m - g of U[0]),
+            # measured velocity = x0[5] (vcom z).
             integral = mpc_utils.wbc_integral_update(
-                integral, desired[self._index_variables_qp['com_pos'] + 2], x0[2], qpos[3:7], theta,
+                integral, desired[self._index_variables_qp['com_acc'] + 2], x0[5], qpos[3:7], theta,
                 wheel_vel, a, alpha, config.d, dt_wbc, wp,
                 jnp.asarray(ww['Ki_com'])[2], ww['Ki_base'], ww['Ki_wheel'])
             heading = jnp.array([jnp.cos(theta), jnp.sin(theta), 0.0])
@@ -179,15 +183,18 @@ class BatchedMPCControllerWrapper:
 
         if x0 is None:
             X_init = self._X0_init
-            ref_rate = jnp.zeros((n, 4))
+            z0 = jnp.full((n,), self.initial_state[2])
+            ref_rate = jnp.stack([jnp.zeros((n,))] * 4 + [z0, jnp.zeros((n,)), z0], axis=1)
         else:
             x0 = jnp.asarray(x0)
             if x0.ndim == 1:
                 x0 = x0[None, :]
             X_init = jnp.broadcast_to(x0[:, None, :], (self.n_env, cfg.N + 1, cfg.nx))
-            # The reference starts at the measured velocities, with zero acceleration.
+            # Profiles start at the measured v, omega and COM height, then continue their own values. The
+            # references restart from the measurement at every solve (slots 1, 3, 6 and vz_prof are
+            # outputs only).
             zero = jnp.zeros_like(x0[:, 11])
-            ref_rate = jnp.stack([x0[:, 11], zero, x0[:, 12], zero], axis=1)
+            ref_rate = jnp.stack([x0[:, 11], x0[:, 11], x0[:, 12], x0[:, 12], x0[:, 2], zero, x0[:, 2]], axis=1)
 
         return MPCState(
             sol=ControlSol(a=a, ac_z=ac_z, alpha=alpha, grf=grf),
@@ -201,7 +208,8 @@ class BatchedMPCControllerWrapper:
     def init_integral(self) -> WBCIntegral:
         """WBC integral memory at zero (no previous wheel speed: the first step only primes it)."""
         n = self.n_env
-        return WBCIntegral(com=jnp.zeros((n, 3)), base=jnp.zeros((n, 3)), wheel=jnp.zeros((n, 2)),
+        return WBCIntegral(com=jnp.zeros((n, 3)), com_vz_prev=jnp.zeros((n,)), com_az_asked=jnp.zeros((n,)),
+                           base=jnp.zeros((n, 3)), wheel=jnp.zeros((n, 2)),
                            wheel_v_prev=jnp.zeros((n, 2)), wheel_a_asked=jnp.zeros((n, 2)),
                            primed=jnp.zeros((n,)), phase=jnp.zeros((n,)))
 
@@ -275,23 +283,17 @@ class BatchedMPCControllerWrapper:
             raise ValueError(f'MPC weights must have the keys of W_mpc["W"] in the same order: {keys}')
         return jnp.diag(jnp.array([float(weights[k]) for k in keys], dtype=jnp.float64))
 
-    def whole_body_run(self, state: MPCState, x0, qpos, qvel, pl_world, pr_world, dpl_world, dpr_world, com_height_target=None, phase="W", ww=None, wp=None, phase_id=None):
+    def whole_body_run(self, state: MPCState, x0, qpos, qvel, pl_world, pr_world, dpl_world, dpr_world, phase="W", ww=None, wp=None, phase_id=None):
         """WBC with the gains ww (config.W_wbc "weights") and the integral limits wp (config.W_wbc
         com/base/wheel_integral_max), else those of the phase; phase_id = index of the phase in
         config.weight_phases, else that of phase. Inside a jitted caller pass ww, wp and phase_id as
         inputs (else XLA compiles them as constants).
         Updates the integral memory (state.integral) on this step's state before the QP and returns
         it in the returned state: keep that state for the next WBC step. Rule: gain 0 -> integral 0;
-        when phase_id changes from the previous step every integral restarts from 0."""
+        when phase_id changes from the previous step every integral restarts from 0.
+        References: the measured state integrated over wbc_lookahead_dt with the MPC input
+        state.sol (_build_desired_impl)."""
         desired = self._build_desired_jit(x0, qpos, state, pl_world, pr_world, dpl_world, dpr_world)
-        if com_height_target is not None:
-            # ROS/Gazebo runs asynchronously and has different contact dynamics.
-            # Keep actual vertical task feedback instead of cancelling its PD
-            # error by setting the desired position/velocity to the measurement.
-            # MPC still supplies feedforward acceleration. Standalone callers
-            # retain their original behavior when no height target is supplied.
-            desired = desired.at[:, self._index_variables_qp['com_pos'] + 2].set(com_height_target)
-            desired = desired.at[:, self._index_variables_qp['com_vel'] + 2].set(0.0)
         force_ref = state.sol.grf if getattr(self.config, 'wbc_force_reg_mpc', True) else jnp.zeros_like(state.sol.grf)
         if ww is None:
             ww = self.config.W_wbc[phase]["weights"]
@@ -359,6 +361,8 @@ class BatchedMPCControllerWrapper:
         return tita_state, x0, theta
 
     def _build_desired_impl(self, x0, qpos, state, pl_world, pr_world, dpl_world, dpr_world):
+        """WBC references: the current measured state (x0, wheel contacts) integrated over
+        wbc_lookahead_dt with the MPC input state.sol."""
         cfg = self.config
         B = qpos.shape[0]
         desired = jnp.zeros((B, self._desired_size))

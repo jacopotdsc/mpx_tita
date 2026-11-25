@@ -24,7 +24,7 @@ dt_mpc = 0.025
 N = 12
 mpc_horizon_s = N * dt_mpc
 mpc_iterations = 1
-wbc_lookahead_dt = 0.0
+wbc_lookahead_dt = 0.0 #1/whole_body_frequency  
 
 dt_sim = 1.0 / simulation_frequency
 dt_wbc = 1.0 / whole_body_frequency
@@ -32,18 +32,18 @@ mpc_period_steps = simulation_frequency / mpc_frequency
 wbc_period_steps = round(simulation_frequency / whole_body_frequency)
 mpc_shift_nodes = round(1.0 / (mpc_frequency * dt_mpc))
 
-T_TRAJECTORY = 60
 grav = 9.81
 
 robot_height = 0.44  # Robot base height in meters
-h_min = 0.28
+h_min = 0.23
 h_max = 0.4
 
-a_default = 4.0       # m/s^2
-tau_v = 0.25          # s; a 1 m/s step peaks at 1/(e*tau) = 1.47 m/s^2
-alpha_default = 1.0   # rad/s^2
-tau_omega = 0.5       # s
-az_default = 1.0      # m/s^2, ramp of the vertical velocity reference
+a_default = 4.0       # m/s^2, max slope of the v reference (it restarts from the measured v) towards the profile; 1.0 stopped from 2 m/s in 3.3 m instead of 1.4 (2026-11-22)
+tau_v = 0.4           # s; first-order velocity profile (mpc_utils): t98 = 3.9*tau = 1.6 s; a 1 m/s step starts at 1/tau = 2.5 m/s^2
+alpha_default = 4.0   # rad/s^2, max slope of the omega reference (as a_default); 1.0 kept turning 166 deg after a stop from wz 1.84 (2026-11-22)
+tau_omega = 0.7       # s; first-order yaw-rate profile: t98 = 2.7 s; a 1 rad/s step starts at 1.43 rad/s^2 (> alpha_default: limited to 1)
+tau_z = 0.5           # s; first-order height profile (after the 0.1 m/s ramp of mpx_node): t98 = 2.0 s on a step
+vz_max = 0.2          # m/s, max slope of the height reference towards the profile (as a_default for v)
 com_z_to_track = 0.4
 clearence_speed = 0.4
 
@@ -92,7 +92,7 @@ _W_wbc = dict(
     w_qddot=1e-12,
     w_force=1e-4,                   # force regularization; stabilizes convergence while braking
     w_com=1e0, w_lwheel=1e0, w_rwheel=1e0, w_base=1e0,
-    Ki_com=[0.0, 0.0, 0e2],         # 1/s^3, integral of the COM error
+    Ki_com=[0.0, 0.0, 0.0],        # 1/s, z only: vertical COM velocity deficit (as Ki_wheel), 0 = off
     Ki_base=0e2,                    # 1/s^3, integral of the base roll/pitch error, 0 = off
     Ki_wheel=10.0,                   # 1/s, integral of the wheel acceleration not made (friction), 0 = off
     # Track width task: internal lateral contact force F_in = Kp_track * (d - track), positive =
@@ -103,11 +103,13 @@ _W_wbc = dict(
     Kp_track=1e3,                   # N/m
 )
 _wbc_params = dict(
-    # Integral of the COM task (Ki_com): a_com += Ki_com * integral(COM error). z only: removes the
-    # steady-state sag when the actuators are weaker than the model (real robot legs ~1.3x).
-    # Integrates only while Ki_com z > 0. No band; |integral| <= max.
-    com_integral_max=0.05,          # m*s
-    # Integral of the base orientation task (Ki_base, roll/pitch only), as Ki_com:
+    # Integral of the COM task (Ki_com, 1/s), as Ki_wheel: a_com_z += Ki_com_z * deficit, deficit =
+    # integral of (vertical COM acceleration the MPC asked = (f_L + f_R)_z / m - g - the one the COM
+    # made). z only: removes the vertical motion lost when the actuators are weaker than the model
+    # (real robot knees ~77 % of the commanded torque). Integrates only while Ki_com z != 0.
+    # No band; |deficit| <= max.
+    com_integral_max=0.5,           # m/s
+    # Integral of the base orientation task (Ki_base, roll/pitch only):
     # a_base += Ki_base * integral(base levelling error). No band; |integral| <= max.
     base_integral_max=0.3,          # rad*s
     # Integral of the wheel tasks (Ki_wheel): a_wheel += Ki_wheel * deficit, deficit = integral of
@@ -125,11 +127,11 @@ def replace(base, **changes):
 
 W_wbc = {
     "W": dict(
-        weights=replace(_W_wbc, Kd_motion=3e1, Ki_com=[0.0, 0.0, 1e2]),
+        weights=replace(_W_wbc, Kd_motion=3e1, Ki_com=[0.0, 0.0, 10.0]),
         **_wbc_params
         ),
     "W_standup": dict(
-        weights=replace(_W_wbc, Kd_motion=3e1, Ki_com=[0.0, 0.0, 0.0]),
+        weights=replace(_W_wbc, Kd_motion=3e1, Ki_com=[0.0, 0.0, 10.0]),
         **_wbc_params
         ),
 }

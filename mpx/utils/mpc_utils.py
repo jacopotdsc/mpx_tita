@@ -287,7 +287,8 @@ def reference_generator_dfcip_online(
     tau_v: float,
     alpha_default: float,
     tau_omega: float,
-    az_default: float,
+    tau_z: float,
+    vz_max: float,
     x0: jax.Array,
     cmd: jax.Array,
     rate0: jax.Array,
@@ -295,12 +296,24 @@ def reference_generator_dfcip_online(
     z_contact_ref = 0.0
     vcz_ref = 0.0
 
-    # Velocity / yaw-rate profile: critically damped second order towards the command (time
-    # constant tau_v / tau_omega), so its acceleration rises from and returns to zero without
-    # overshoot. rate0 = [v, acc_v, omega, acc_omega] continues the previous solve's profile
-    # (MPCState.ref_rate). The references start from the measured velocities and follow the
-    # profile with slope <= a_default / alpha_default.
-    z_position_gain = 2.0
+    # Velocity / yaw-rate / height profiles, all built the same way: first order (exponential)
+    # towards the command, r(t) = r* - e * exp(-t / tau), time constant tau_v / tau_omega / tau_z,
+    # no overshoot. A command step makes the profile slope jump to e / tau (for v and omega an
+    # acceleration step: the MPC input; the height command comes through the 0.1 m/s ramp of
+    # mpx_node, so its vertical velocity stays continuous).
+    # Profiles: they continue the previous solve (MPCState.ref_rate slots 0, 2, 4), so they reach the
+    # command in the time set by tau.
+    # References: closed loop (as on the real robot), the v / omega / height references restart from
+    # the measured v / omega / COM height at every solve and follow their profile with slope
+    # <= a_default / alpha_default / vz_max: the error the MPC sees stays small when the robot lags
+    # (pendulum, friction, pushes), no windup. Tried on 2026-11-21 in Gazebo: open-loop references
+    # (continuing the previous solve) made the robot fall on a 1 -> -1 m/s step with a_default 4;
+    # profiles restarting from the measurement left a steady-state error (omega 0.90 for 1 rad/s).
+    # Position and heading (p_xy, theta) start from the measured ones and integrate the v / omega
+    # references.
+    # rate0 = [v_prof, v_ref, omega_prof, omega_ref, z_prof, vz_prof, z_ref]; only the profiles
+    # (slots 0, 2, 4) are used; v_ref / omega_ref / z_ref (node 1) and vz_prof (height profile slope)
+    # are outputs only.
 
     pcom0 = x0[0:3]
     vcom_z0 = x0[5]
@@ -348,24 +361,23 @@ def reference_generator_dfcip_online(
             m * grav / 2.0,
         ])
 
-    def second_order(rate, acc, target, tau):
-        acc_next = acc + dt * ((target - rate) / tau**2 - 2.0 * acc / tau)
-        return rate + acc_next * dt, acc_next
+    def step_profile(rate, target, tau):
+        # One step (dt) of the reference profile towards the command: first order (exponential).
+        # Exact discretisation of d(rate)/dt = (target - rate) / tau over dt; also returns the slope.
+        rate_next = target + (rate - target) * jnp.exp(-dt / tau)
+        return rate_next, (rate_next - rate) / dt
 
     def scan_step(carry, _):
-        p_xy, z, theta, v, vz, omega, v_prof, acc_v, omega_prof, acc_omega = carry
+        p_xy, z, theta, v, omega, v_prof, omega_prof, z_prof = carry
 
-        v_prof_next, acc_v_next = second_order(v_prof, acc_v, v_des, tau_v)
+        v_prof_next, _ = step_profile(v_prof, v_des, tau_v)
         v_next = move_towards(v, v_prof_next, a_default * dt)
 
-        vz_target = z_position_gain * (z_com_ref - z)
-        vz_next = move_towards(
-            vz,
-            vz_target,
-            az_default * dt,
-        )
+        z_prof_next, vz_prof_next = step_profile(z_prof, z_com_ref, tau_z)
+        z_next = move_towards(z, z_prof_next, vz_max * dt)
+        vz_next = (z_next - z) / dt
 
-        omega_prof_next, acc_omega_next = second_order(omega_prof, acc_omega, omega_des, tau_omega)
+        omega_prof_next, _ = step_profile(omega_prof, omega_des, tau_omega)
         omega_next = move_towards(omega, omega_prof_next, alpha_default * dt)
 
         vx_next = v_next * jnp.cos(theta)
@@ -376,7 +388,6 @@ def reference_generator_dfcip_online(
             vy_next * dt,
         ])
 
-        z_next = z + vz_next * dt
         theta_next = theta + omega_next * dt
 
         x_ref_t = build_state(
@@ -397,15 +408,13 @@ def reference_generator_dfcip_online(
             z_next,
             theta_next,
             v_next,
-            vz_next,
             omega_next,
             v_prof_next,
-            acc_v_next,
             omega_prof_next,
-            acc_omega_next,
+            z_prof_next,
         )
 
-        rate_t = jnp.stack([v_prof_next, acc_v_next, omega_prof_next, acc_omega_next])
+        rate_t = jnp.stack([v_prof_next, v_next, omega_prof_next, omega_next, z_prof_next, vz_prof_next, z_next])
         return carry_next, (x_ref_t, u_ref_t, rate_t)
 
     x_init = build_state(
@@ -420,19 +429,16 @@ def reference_generator_dfcip_online(
     )
     u_init = build_u_ref()
     p_xy0 = pcom0[0:2]
-    p_z = pcom0[2]
 
     carry0 = (
         p_xy0,
-        p_z,
+        rate0[6],  # height reference continues the previous solve's z_ref (open loop, test 2026-11-23)
         theta0,
-        v0,
-        vcom_z0,
-        omega0,
-        rate0[0],
-        rate0[1],
-        rate0[2],
-        rate0[3],
+        v0,        # v reference restarts from the measured v (closed loop)
+        omega0,    # omega reference restarts from the measured omega (closed loop)
+        rate0[0],  # v profile of the previous solve
+        rate0[2],  # omega profile of the previous solve
+        rate0[4],  # height profile of the previous solve
     )
 
     _, (x_scan, u_scan, rate_scan) = jax.lax.scan(
@@ -565,15 +571,18 @@ def err_rotation(Ra, Rb):
     err = angle * (Ra @ axis)
     return jnp.where(angle < 1e-7, jnp.zeros(3), err)
 
-def wbc_integral_update(integral, desired_com_z, pcom_z, base_quat, theta, wheel_vel_world,
+def wbc_integral_update(integral, com_az_asked, vcom_z, base_quat, theta, wheel_vel_world,
                         a, alpha, d, dt, wp, Ki_com_z, Ki_base, Ki_wheel):
     """One WBC step of the integral memory (one robot, pure): returns the updated ``integral``.
 
     ``integral`` has the fields of mpc_wrapper_dfcip.WBCIntegral (one robot). Rule per term: gain
     0 -> its integral is 0; gain != 0 -> it integrates and keeps its value (the reset at a phase
     change is done by the caller, mpc_wrapper_dfcip.whole_body_run). No band; each integral is bounded only by its maximum in ``wp`` (config W_wbc entry).
-    - com: z = integral of (COM height target - measured COM height); x, y stay 0 (the
-      horizontal COM target comes from the MPC).
+    - com: z = vertical COM velocity deficit, as the wheels: time integral of the vertical COM
+      acceleration the MPC asked at the previous step (com_az_asked = (f_L + f_R)_z / m - g, the
+      CoM task feedforward) minus the one the COM made since then (from vcom_z, the measured
+      vertical COM velocity): the vertical motion lost to weak actuators / model error. x, y stay 0.
+      Skipped at the first step after a reset (primed 0).
     - base: integral of the base roll/pitch error, angle-axis (``err_rotation``) with the target
       = the base levelled at its own yaw; the yaw component is 0 (heading is the MPC's job).
     - wheel: per wheel [left, right], time integral of the acceleration along the heading the MPC
@@ -584,7 +593,9 @@ def wbc_integral_update(integral, desired_com_z, pcom_z, base_quat, theta, wheel
     """
     com_max, base_max, wheel_max = wp['com_integral_max'], wp['base_integral_max'], wp['wheel_integral_max']
 
-    com_z = jnp.clip(integral.com[2] + (desired_com_z - pcom_z) * dt, -com_max, com_max)
+    az_done = (vcom_z - integral.com_vz_prev) / dt
+    step_z = jnp.where(integral.primed > 0.5, (integral.com_az_asked - az_done) * dt, 0.0)
+    com_z = jnp.clip(integral.com[2] + step_z, -com_max, com_max)
     com = integral.com.at[2].set(jnp.where(Ki_com_z != 0, com_z, 0.0))
 
     Rb = math.quat_to_mat(base_quat / jnp.linalg.norm(base_quat))
@@ -599,11 +610,13 @@ def wbc_integral_update(integral, desired_com_z, pcom_z, base_quat, theta, wheel
     a_done = (wheel_v - integral.wheel_v_prev) / dt
     step = jnp.where(integral.primed > 0.5, (integral.wheel_a_asked - a_done) * dt, 0.0)
     wheel = jnp.where(Ki_wheel != 0, jnp.clip(integral.wheel + step, -wheel_max, wheel_max), 0.0)
-    # wheel_v_prev / wheel_a_asked are updated at every step (also with Ki_wheel 0), so the deficit
-    # starts from a valid previous speed when Ki_wheel becomes non-zero.
+    # wheel_v_prev / wheel_a_asked (and com_vz_prev / com_az_asked) are updated at every step (also
+    # with the gain 0), so the deficit starts from a valid previous speed when the gain becomes non-zero.
 
     return integral.replace(
         com=com, base=base, wheel=wheel,
+        com_vz_prev=vcom_z,
+        com_az_asked=com_az_asked,
         wheel_v_prev=wheel_v,
         wheel_a_asked=jnp.stack([a - alpha * d / 2.0, a + alpha * d / 2.0]),
         primed=jnp.ones_like(integral.primed),
